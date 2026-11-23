@@ -5,6 +5,12 @@
  *   GET  /__emu/state        last state reported by the app (JSON)
  *   POST /__emu/send         send a command (JSON body, see src/dev/emulator.ts)
  *   GET  /__emu/screenshot   proxy of the simulator's glasses framebuffer
+ *   WS   /__emu/ws           hub for external clients (the Unreal simulator):
+ *                            text frames in  = commands (same JSON as /send,
+ *                                              optional `id` is echoed in an ack)
+ *                            text frames out = {type:'hello'|'state'|'ack', ...}
+ *                            binary out      = glasses framebuffer PNG, sent
+ *                                              only when it changes
  *
  * Routing rule for touch input: right-temple gestures, and anything that
  * scrolls or selects inside a list container, are forwarded to the
@@ -18,6 +24,7 @@ import { readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import type { Plugin, ViteDevServer } from 'vite'
+import { WebSocketServer, type WebSocket } from 'ws'
 
 interface Options {
   /** Port passed to `evenhub-simulator --automation-port`. */
@@ -32,6 +39,13 @@ const SIM_ACTION: Record<string, string> = {
   longStart: 'long_press',
   longEnd: 'long_press_release',
 }
+
+/** Hub protocol version, bumped on breaking changes to the WS messages. */
+const HUB_VERSION = 1
+/** The simulator takes ~200 ms per screenshot but serves requests in parallel:
+ *  up to FRAME_POLLERS requests in flight, one started every PERIOD/POLLERS. */
+const FRAME_POLLERS = 2
+const FRAME_PERIOD_MS = 200
 
 const PANEL = fileURLToPath(new URL('./panel.html', import.meta.url))
 
@@ -100,9 +114,131 @@ export function evenEmulator(options: Options = {}): Plugin {
     name: 'even-g2-emulator',
     apply: 'serve',
     configureServer(server) {
+      // ------------------------------------------------ external client hub
+      const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 })
+      const PAGE_ALIVE_MS = 15000
+      /** A client this far behind gets no new frames until it catches up. */
+      const MAX_FRAME_BACKLOG = 256 * 1024
+      /** A client this far behind is not reading at all: drop it. */
+      const MAX_BACKLOG = 8 * 1024 * 1024
+      let lastFrame: Buffer | null = null
+      let lastAlive = false
+
+      const pageAlive = () => Date.now() - reportedAt < PAGE_ALIVE_MS
+      const stateMessage = () => {
+        lastAlive = pageAlive()
+        return JSON.stringify({ type: 'state', app: appState, connected: lastAlive, reportedAt })
+      }
+      const sendTo = (c: WebSocket, data: string | Buffer, droppable: boolean) => {
+        if (c.readyState !== c.OPEN) return
+        if (c.bufferedAmount > MAX_BACKLOG) {
+          c.terminate()
+          return
+        }
+        if (droppable && c.bufferedAmount > MAX_FRAME_BACKLOG) return // superseded by a later frame
+        c.send(data)
+      }
+      const broadcast = (data: string | Buffer, droppable = false) => {
+        for (const c of wss.clients) sendTo(c, data, droppable)
+      }
+
+      // While anyone is listening: poll the simulator's framebuffer and push
+      // only changed frames, and keep the page's liveness fresh. Requests
+      // overlap (~200 ms each, served in parallel); a response older than the
+      // last published one is discarded so frames never go backwards.
+      let hubTimer: ReturnType<typeof setInterval> | undefined
+      let inFlight = 0
+      let requestSeq = 0
+      let publishedSeq = 0
+      let simDownUntil = 0
+      let tick = 0
+      const pollFrame = async () => {
+        if (inFlight >= FRAME_POLLERS || Date.now() < simDownUntil) return
+        const seq = ++requestSeq
+        inFlight++
+        try {
+          const r = await fetch(`${simBase}/api/screenshot/glasses`, { signal: AbortSignal.timeout(3000) })
+          if (!r.ok) return
+          const png = Buffer.from(await r.arrayBuffer())
+          if (seq < publishedSeq) return
+          publishedSeq = seq
+          if (lastFrame && png.equals(lastFrame)) return
+          lastFrame = png
+          broadcast(png, true)
+        } catch {
+          simDownUntil = Date.now() + 1000 // simulator not running
+        } finally {
+          inFlight--
+        }
+      }
+      const hubTick = () => {
+        void pollFrame()
+        if (++tick % 20 !== 0) return // every 2 s:
+        if (Date.now() - reportedAt > 3000) server.ws.send({ type: 'custom', event: 'even-emu:ping', data: {} })
+        if (pageAlive() !== lastAlive) broadcast(stateMessage())
+      }
+      const startHub = () => {
+        if (hubTimer) return
+        server.ws.send({ type: 'custom', event: 'even-emu:ping', data: {} })
+        hubTimer = setInterval(hubTick, FRAME_PERIOD_MS / FRAME_POLLERS)
+      }
+      const stopHubIfIdle = () => {
+        if (wss.clients.size > 0 || !hubTimer) return
+        clearInterval(hubTimer)
+        hubTimer = undefined
+      }
+
+      const ack = (ws: WebSocket, body: Record<string, unknown>) => sendTo(ws, JSON.stringify({ type: 'ack', ...body }), false)
+      wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+        // Oversized or malformed frames emit 'error'; unhandled it would kill the dev server.
+        ws.on('error', e => {
+          server.config.logger.warn(`[emu] hub client error: ${e.message}`)
+          ws.terminate()
+        })
+        ws.on('close', () => {
+          server.config.logger.info('[emu] hub client disconnected')
+          stopHubIfIdle()
+        })
+        ws.on('message', (raw, isBinary) => {
+          if (isBinary) return
+          void (async () => {
+            let cmd: unknown
+            try {
+              cmd = JSON.parse(raw.toString())
+            } catch {
+              ack(ws, { ok: false, error: 'invalid JSON' })
+              return
+            }
+            if (typeof cmd !== 'object' || cmd === null || Array.isArray(cmd) || typeof (cmd as { type?: unknown }).type !== 'string') {
+              ack(ws, { ok: false, error: 'expected an object with a string "type"' })
+              return
+            }
+            const { id, ...rest } = cmd as Record<string, unknown>
+            const result = await route(server, rest).catch(e => ({ ok: false, error: String(e) }))
+            if (id !== undefined) ack(ws, { id, ...result })
+          })().catch(e => server.config.logger.warn(`[emu] hub message failed: ${String(e)}`))
+        })
+
+        server.config.logger.info(`[emu] hub client connected (${req.socket.remoteAddress})`)
+        ws.send(JSON.stringify({ type: 'hello', version: HUB_VERSION, simulatorPort: simPort }))
+        ws.send(stateMessage())
+        if (lastFrame) ws.send(lastFrame)
+        startHub()
+      })
+
+      server.httpServer?.on('upgrade', (req, socket, head) => {
+        if ((req.url ?? '').split('?')[0] !== '/__emu/ws') return // Vite HMR and others
+        wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req))
+      })
+      server.httpServer?.once('close', () => {
+        if (hubTimer) clearInterval(hubTimer)
+        wss.close()
+      })
+
       server.ws.on('even-emu:report', data => {
         appState = (data ?? {}) as Record<string, unknown>
         reportedAt = Date.now()
+        if (wss.clients.size > 0) broadcast(stateMessage())
       })
 
       server.middlewares.use(async (req, res, next) => {

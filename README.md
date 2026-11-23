@@ -52,6 +52,11 @@ The simulator rejects `imuControl`, the location APIs, `pickImageFromAlbum` and 
 - Scriptable: `curl -X POST localhost:5173/__emu/send -d '{"type":"input","source":"ring","gesture":"tap"}'`
 - The emulator is active only inside the simulator (`?emu=1` / `?emu=0` to force). It is dev-server only and is not in `npm run build` or the `.ehpk`.
 - **Assumption:** IMU units and axes are undocumented. Emulated values are head angles in degrees (x = nod, y = shake, z = tilt). Re-tune on hardware.
+- External clients connect to the hub at `ws://<host>:5173/__emu/ws`: JSON commands in (same as `/__emu/send`, an optional `id` is echoed in an `ack`), `hello` / `state` JSON and changed glasses frames (binary PNG) out. IMU `mode: "external"` with `sample: {x, y, z}` streams a client's head pose; `location` with `live: true` moves the GPS fix without an immediate push.
+
+## Unreal simulator (G2Sim)
+
+`unreal/G2Sim` is a UE 5.8 desktop simulator: walk a 3D city in first person with the live glasses display over your view. Mouse look becomes IMU, walking becomes GPS, mouse and keys become temple / ring / context-menu input. Teammates without Unreal run the packaged `G2Sim.exe` alongside `npm run dev` and `npm run simulate`. See [unreal/G2Sim/README.md](unreal/G2Sim/README.md).
 
 ## Known simulator differences
 
@@ -67,7 +72,8 @@ src/app.ts             router, global gestures, lifecycle
 src/core/              bridge queue + page model, input parsing, UI/glyph helpers, canvas → PNG
 src/screens/           one file per feature screen
 src/dev/emulator.ts    in-page emulator (dev only)
-tools/emulator/        Vite plugin + control panel
+tools/emulator/        Vite plugin + control panel + WebSocket hub
+unreal/G2Sim/          Unreal Engine 5.8 desktop simulator
 ```
 
 ## Pack

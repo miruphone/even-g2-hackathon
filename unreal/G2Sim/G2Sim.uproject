@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "{C9E6A38F-4022-4352-20C0-579668652149}",
+	"Category": "",
+	"Description": "Even Realities G2 glasses simulator: walk a 3D scene with the live glasses display from the Even Hub simulator.",
+	"Modules": [
+		{
+			"Name": "G2Sim",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "OpenXR",
+			"Enabled": false
+		}
+	]
+}

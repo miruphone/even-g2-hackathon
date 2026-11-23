@@ -27,16 +27,20 @@ import { log } from '../core/log'
 
 type Source = 'right' | 'left' | 'ring'
 type Gesture = 'tap' | 'double' | 'up' | 'down' | 'longStart' | 'longEnd'
-type ImuMode = 'still' | 'nod' | 'shake' | 'tilt' | 'walk' | 'manual'
+/** `external`: samples are streamed in by a client (the Unreal simulator). */
+type ImuMode = 'still' | 'nod' | 'shake' | 'tilt' | 'walk' | 'manual' | 'external'
+type Vec3 = { x: number; y: number; z: number }
 type Lifecycle = 'foregroundEnter' | 'foregroundExit' | 'abnormalExit' | 'systemExit'
 
 type Command =
   | { type: 'input'; source: Source; gesture: Gesture; index?: number }
   | { type: 'menu'; itemId: number }
   | { type: 'lifecycle'; event: Lifecycle }
-  | { type: 'imu'; mode?: ImuMode; burst?: 'nod' | 'shake'; manual?: { x: number; y: number; z: number } }
+  | { type: 'imu'; mode?: ImuMode; burst?: 'nod' | 'shake'; manual?: Vec3; sample?: Vec3 }
   | { type: 'device'; status: Partial<{ connectType: string; isWearing: boolean; batteryLevel: number; isCharging: boolean; isInCase: boolean }> }
-  | { type: 'location'; lat: number; lon: number; accuracy?: number }
+  // `live`: a moving client position. It updates the current fix without an
+  // immediate push or resetting the route; the update timer delivers it.
+  | { type: 'location'; lat: number; lon: number; accuracy?: number; heading?: number; speed?: number; live?: boolean }
   | { type: 'route'; on: boolean }
   | { type: 'image'; dataUrl: string | null; name?: string }
   | { type: 'raw'; method: string; data: unknown }
@@ -67,9 +71,9 @@ export function installEmulator(bridge: EvenAppBridge) {
   const st = {
     capture: null as Capture | null,
     menu: [] as { id: number; label: string }[],
-    imu: { on: false, pace: 0, mode: 'still' as ImuMode, burst: null as null | { kind: 'nod' | 'shake'; until: number }, manual: { x: 0, y: 0, z: 0 }, sent: 0 },
+    imu: { on: false, pace: 0, mode: 'still' as ImuMode, burst: null as null | { kind: 'nod' | 'shake'; until: number }, manual: { x: 0, y: 0, z: 0 }, external: { x: 0, y: 0, z: 0 }, sent: 0 },
     audio: { on: false, source: '' },
-    location: { updating: false, intervalMs: 2000, lat: 35.681236, lon: 139.767125, accuracy: 5, route: false, routeStart: 0, center: { lat: 35.681236, lon: 139.767125 } },
+    location: { updating: false, intervalMs: 2000, lat: 35.681236, lon: 139.767125, accuracy: 5, heading: undefined as number | undefined, speed: 0, route: false, routeStart: 0, center: { lat: 35.681236, lon: 139.767125 } },
     status: null as null | Record<string, unknown>,
     image: null as null | { dataUrl: string; name: string },
     injected: 0,
@@ -154,6 +158,7 @@ export function installEmulator(bridge: EvenAppBridge) {
       case 'tilt': return { x: n(), y: n(), z: 25 * Math.sin(2 * Math.PI * 0.25 * t) + n() }
       case 'walk': return { x: 4 * Math.sin(2 * Math.PI * 1.9 * t) + n() * 3, y: 6 * Math.sin(2 * Math.PI * 0.1 * t) + n(), z: 3 * Math.sin(2 * Math.PI * 0.95 * t) + n() * 2 }
       case 'manual': return { x: manual.x + n() * 0.2, y: manual.y + n() * 0.2, z: manual.z + n() * 0.2 }
+      case 'external': return st.imu.external
       default: return { x: n(), y: n(), z: n() }
     }
   }
@@ -193,7 +198,7 @@ export function installEmulator(bridge: EvenAppBridge) {
       L.lon = L.center.lon + dLon
       return { latitude: L.lat, longitude: L.lon, accuracy: L.accuracy, speed, altitude: 40, heading: ((angle * 180) / Math.PI + 90) % 360, timestamp: Date.now() }
     }
-    return { latitude: L.lat, longitude: L.lon, accuracy: L.accuracy, speed: 0, altitude: 40, timestamp: Date.now() }
+    return { latitude: L.lat, longitude: L.lon, accuracy: L.accuracy, speed: L.speed, altitude: 40, ...(L.heading !== undefined ? { heading: L.heading } : {}), timestamp: Date.now() }
   }
   const pushLocation = () => push('appLocationChanged', currentLocation())
   bridge.getAppLocation = async () => {
@@ -293,6 +298,11 @@ export function installEmulator(bridge: EvenAppBridge) {
       case 'imu':
         if (cmd.mode) st.imu.mode = cmd.mode
         if (cmd.manual) st.imu.manual = cmd.manual
+        if (cmd.sample) {
+          st.imu.external = cmd.sample
+          if (!cmd.mode && st.imu.mode !== 'external') st.imu.mode = 'external'
+          return // high-rate stream: skip the state report
+        }
         if (cmd.burst) st.imu.burst = { kind: cmd.burst, until: Date.now() + 1500 }
         break
       case 'device': {
@@ -306,7 +316,10 @@ export function installEmulator(bridge: EvenAppBridge) {
         st.location.lat = cmd.lat
         st.location.lon = cmd.lon
         st.location.center = { lat: cmd.lat, lon: cmd.lon }
+        st.location.heading = cmd.heading
+        st.location.speed = cmd.speed ?? 0
         if (cmd.accuracy !== undefined) st.location.accuracy = cmd.accuracy
+        if (cmd.live) return // the update timer delivers it; no report spam
         if (st.location.updating) pushLocation()
         break
       case 'route':

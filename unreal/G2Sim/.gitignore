@@ -1,0 +1,10 @@
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+Packaged/
+.vs/
+*.sln
+*.slnx
+*.vsconfig
