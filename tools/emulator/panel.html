@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>G2 Emulator</title>
+<style>
+  :root {
+    --bg: #161616; --panel: #212121; --panel2: #2a2a2a; --line: #353535;
+    --text: #e8e8e8; --muted: #9a9a9a; --accent: #5ee27a; --accent-ink: #0d2a14; --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #111; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; display: inline-block; margin-right: 6px; }
+  .dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .pill { font-size: 12px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; }
+  main { display: grid; grid-template-columns: minmax(0, 620px) minmax(0, 1fr); gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; letter-spacing: .03em; }
+  .screen { background: #000; border-radius: 10px; aspect-ratio: 2 / 1; display: grid; place-items: center; overflow: hidden; border: 1px solid #2e2e2e; }
+  .screen img { width: 100%; height: 100%; image-rendering: pixelated; filter: drop-shadow(0 0 2px rgba(94,226,122,.6)); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font: inherit; cursor: pointer; user-select: none; }
+  button:hover { border-color: #555; }
+  button:active, button.held { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.sel { background: #2d4a34; border-color: var(--accent); }
+  button.big { min-width: 92px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+  .seg button:last-child { border-right: 0; }
+  label { color: var(--muted); font-size: 12px; }
+  input[type=number], input[type=text], select { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font: inherit; width: 130px; }
+  input[type=range] { width: 160px; accent-color: var(--accent); }
+  .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 700px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-all; font: 12px/1.55 ui-monospace, Consolas, monospace; color: #cfcfcf; }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+  .warn { color: var(--warn); }
+  kbd { font: 11px ui-monospace, monospace; background: var(--panel2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; }
+  #log { max-height: 220px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>G2 ハードウェア エミュレーター</h1>
+  <span class="pill"><span id="conn" class="dot"></span><span id="connText">アプリ未接続</span></span>
+  <span class="pill" id="capture">入力先: —</span>
+  <span class="pill" id="sensors">IMU: — / マイク: — / 位置: —</span>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>メガネの画面（シミュレーターのライブ表示）</h2>
+      <div class="screen"><img id="shot" alt="glasses" /></div>
+      <div class="row" style="margin-top:10px">
+        <label><input type="checkbox" id="live" checked /> ライブ更新</label>
+        <span class="hint" id="shotInfo"></span>
+      </div>
+    </section>
+
+    <section>
+      <h2>タッチ入力</h2>
+      <div class="row">
+        <div class="seg" id="sources">
+          <button data-src="right" class="sel">右ツル <kbd>1</kbd></button>
+          <button data-src="left">左ツル <kbd>2</kbd></button>
+          <button data-src="ring">リング <kbd>3</kbd></button>
+        </div>
+      </div>
+      <div class="row">
+        <button class="big" data-g="tap">タップ <kbd>Space</kbd></button>
+        <button class="big" data-g="double">ダブル <kbd>D</kbd></button>
+        <button class="big" data-g="up">↑ 上 <kbd>↑</kbd></button>
+        <button class="big" data-g="down">↓ 下 <kbd>↓</kbd></button>
+        <button class="big" id="hold">長押し（押している間） <kbd>L</kbd></button>
+        <button id="hold15">長押し 1.5秒</button>
+      </div>
+      <p class="hint">右ツルの操作と、リストのスクロール・選択はシミュレーター本体へ転送します。左ツル・リングの操作は偽のイベントとして注入します（どちらからの操作かもアプリで判別できます）。</p>
+    </section>
+
+    <section>
+      <h2>コンテキストメニュー（アプリが登録した項目）</h2>
+      <div class="row" id="menu"><span class="hint">メニュー項目なし</span></div>
+      <div class="row"><button id="simMenu">シミュレーターのメニューを開く</button></div>
+    </section>
+
+    <section>
+      <h2>送信ログ</h2>
+      <pre id="log"></pre>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>頭の動き（IMU）— アプリが取得を開始している間だけ送信</h2>
+      <div class="row" id="imuModes">
+        <button data-mode="still" class="sel">静止</button>
+        <button data-mode="nod">うなずき（連続）</button>
+        <button data-mode="shake">首振り（連続）</button>
+        <button data-mode="tilt">首かしげ</button>
+        <button data-mode="walk">歩行</button>
+        <button data-mode="manual">手動</button>
+      </div>
+      <div class="row">
+        <button id="nodOnce">うなずき 1回</button>
+        <button id="shakeOnce">首振り 1回</button>
+      </div>
+      <div class="row">
+        <label>X(縦) <input type="range" id="mx" min="-45" max="45" value="0" /></label>
+        <label>Y(横) <input type="range" id="my" min="-45" max="45" value="0" /></label>
+        <label>Z(傾き) <input type="range" id="mz" min="-45" max="45" value="0" /></label>
+      </div>
+      <p class="hint">値は「頭の角度（度）」として生成します（X=縦の傾き, Y=横の向き, Z=左右の傾き）。<span class="warn">実機の単位と軸の向きは公式資料に記載がないため、実機での調整が必要です。</span></p>
+    </section>
+
+    <div class="grid2">
+      <section>
+        <h2>位置情報</h2>
+        <div class="row">
+          <button data-loc="35.681236,139.767125">東京駅</button>
+          <button data-loc="35.658034,139.701636">渋谷</button>
+          <button data-loc="34.702485,135.495951">大阪駅</button>
+          <button data-loc="25.197197,55.274376">ドバイ</button>
+        </div>
+        <div class="row">
+          <input type="number" id="lat" step="0.000001" value="35.681236" />
+          <input type="number" id="lon" step="0.000001" value="139.767125" />
+          <button id="setLoc">設定</button>
+        </div>
+        <div class="row"><label><input type="checkbox" id="route" /> 歩行ルートを再生（半径120mを時速5km）</label></div>
+      </section>
+
+      <section>
+        <h2>端末の状態</h2>
+        <div class="row">
+          <label><input type="checkbox" id="wearing" checked /> 装着中</label>
+          <label><input type="checkbox" id="charging" /> 充電中</label>
+          <label><input type="checkbox" id="inCase" /> ケース内</label>
+        </div>
+        <div class="row">
+          <label>電池 <input type="range" id="battery" min="0" max="100" value="100" /> <span id="batteryVal">100</span>%</label>
+        </div>
+        <div class="row">
+          <select id="connect">
+            <option value="connected">connected</option>
+            <option value="connecting">connecting</option>
+            <option value="disconnected">disconnected</option>
+            <option value="connectionFailed">connectionFailed</option>
+            <option value="none">none</option>
+          </select>
+          <button id="sendStatus">状態を送信</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="grid2">
+      <section>
+        <h2>ライフサイクル</h2>
+        <div class="row">
+          <button data-life="foregroundExit">バックグラウンドへ</button>
+          <button data-life="foregroundEnter">フォアグラウンドへ</button>
+        </div>
+        <div class="row">
+          <button data-life="systemExit">終了（ユーザー確定）</button>
+          <button data-life="abnormalExit">異常終了</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>カメラ・アルバムが返す画像</h2>
+        <div class="row"><input type="file" id="photo" accept="image/*" /></div>
+        <div class="row"><button id="photoReset">自動生成のサンプルに戻す</button></div>
+        <p class="hint" id="photoName">現在: 自動生成のサンプル</p>
+      </section>
+    </div>
+
+    <section>
+      <h2>アプリの状態（エミュレーターへの報告）</h2>
+      <pre id="state">—</pre>
+    </section>
+  </div>
+</main>
+
+<script>
+  const $ = s => document.querySelector(s)
+  const $$ = s => [...document.querySelectorAll(s)]
+  let source = 'right'
+
+  function logLine(text) {
+    const el = $('#log')
+    el.textContent = `${new Date().toLocaleTimeString()}  ${text}\n` + el.textContent.split('\n').slice(0, 60).join('\n')
+  }
+
+  async function send(cmd) {
+    try {
+      const r = await fetch('/__emu/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cmd) })
+      const j = await r.json()
+      const brief = cmd.type === 'image' ? { type: 'image', name: cmd.name } : cmd
+      logLine(`${JSON.stringify(brief)} → ${j.via ?? ''} ${j.ok ? 'ok' : 'NG'}`)
+      return j
+    } catch (e) {
+      logLine(`送信失敗: ${e}`)
+    }
+  }
+
+  const input = gesture => send({ type: 'input', source, gesture })
+
+  // ---- sources
+  function setSource(s) {
+    source = s
+    $$('#sources button').forEach(b => b.classList.toggle('sel', b.dataset.src === s))
+  }
+  $$('#sources button').forEach(b => b.addEventListener('click', () => setSource(b.dataset.src)))
+
+  // ---- gestures
+  $$('[data-g]').forEach(b => b.addEventListener('click', () => input(b.dataset.g)))
+  const hold = $('#hold')
+  let holding = false
+  const holdStart = () => { if (holding) return; holding = true; hold.classList.add('held'); input('longStart') }
+  const holdEnd = () => { if (!holding) return; holding = false; hold.classList.remove('held'); input('longEnd') }
+  hold.addEventListener('pointerdown', holdStart)
+  hold.addEventListener('pointerup', holdEnd)
+  hold.addEventListener('pointerleave', holdEnd)
+  $('#hold15').addEventListener('click', async () => { await input('longStart'); setTimeout(() => input('longEnd'), 1500) })
+
+  // ---- keyboard
+  document.addEventListener('keydown', e => {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return
+    if (e.repeat && e.key.toLowerCase() !== 'l') return
+    const k = e.key.toLowerCase()
+    if (k === '1') setSource('right')
+    else if (k === '2') setSource('left')
+    else if (k === '3') setSource('ring')
+    else if (k === ' ') { e.preventDefault(); input('tap') }
+    else if (k === 'd') input('double')
+    else if (k === 'arrowup') { e.preventDefault(); input('up') }
+    else if (k === 'arrowdown') { e.preventDefault(); input('down') }
+    else if (k === 'l' && !e.repeat) holdStart()
+  })
+  document.addEventListener('keyup', e => { if (e.key.toLowerCase() === 'l') holdEnd() })
+
+  // ---- menu
+  $('#simMenu').addEventListener('click', () => send({ type: 'simulator', action: 'context_menu' }))
+  let lastMenuKey = ''
+  function renderMenu(items) {
+    const key = JSON.stringify(items ?? [])
+    if (key === lastMenuKey) return
+    lastMenuKey = key
+    const box = $('#menu')
+    box.innerHTML = ''
+    if (!items?.length) { box.innerHTML = '<span class="hint">メニュー項目なし</span>'; return }
+    for (const m of items) {
+      const b = document.createElement('button')
+      b.textContent = `${m.label} (#${m.id})`
+      b.addEventListener('click', () => send({ type: 'menu', itemId: m.id }))
+      box.appendChild(b)
+    }
+  }
+
+  // ---- IMU
+  function setMode(mode) {
+    $$('#imuModes button').forEach(b => b.classList.toggle('sel', b.dataset.mode === mode))
+    send({ type: 'imu', mode })
+  }
+  $$('#imuModes button').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)))
+  $('#nodOnce').addEventListener('click', () => send({ type: 'imu', burst: 'nod' }))
+  $('#shakeOnce').addEventListener('click', () => send({ type: 'imu', burst: 'shake' }))
+  let manualTimer
+  ;['#mx', '#my', '#mz'].forEach(id => $(id).addEventListener('input', () => {
+    clearTimeout(manualTimer)
+    manualTimer = setTimeout(() => {
+      $$('#imuModes button').forEach(b => b.classList.toggle('sel', b.dataset.mode === 'manual'))
+      send({ type: 'imu', mode: 'manual', manual: { x: +$('#mx').value, y: +$('#my').value, z: +$('#mz').value } })
+    }, 80)
+  }))
+
+  // ---- location
+  $$('[data-loc]').forEach(b => b.addEventListener('click', () => {
+    const [lat, lon] = b.dataset.loc.split(',').map(Number)
+    $('#lat').value = lat; $('#lon').value = lon; $('#route').checked = false
+    send({ type: 'location', lat, lon })
+  }))
+  $('#setLoc').addEventListener('click', () => { $('#route').checked = false; send({ type: 'location', lat: +$('#lat').value, lon: +$('#lon').value }) })
+  $('#route').addEventListener('change', e => send({ type: 'route', on: e.target.checked }))
+
+  // ---- device
+  $('#battery').addEventListener('input', e => { $('#batteryVal').textContent = e.target.value })
+  const sendStatus = () => send({ type: 'device', status: {
+    isWearing: $('#wearing').checked, isCharging: $('#charging').checked, isInCase: $('#inCase').checked,
+    batteryLevel: +$('#battery').value, connectType: $('#connect').value,
+  } })
+  $('#sendStatus').addEventListener('click', sendStatus)
+  ;['#wearing', '#charging', '#inCase', '#connect'].forEach(id => $(id).addEventListener('change', sendStatus))
+  $('#battery').addEventListener('change', sendStatus)
+
+  // ---- lifecycle
+  $$('[data-life]').forEach(b => b.addEventListener('click', () => send({ type: 'lifecycle', event: b.dataset.life })))
+
+  // ---- photo
+  $('#photo').addEventListener('change', e => {
+    const f = e.target.files?.[0]
+    if (!f) return
+    const r = new FileReader()
+    r.onload = () => { send({ type: 'image', dataUrl: r.result, name: f.name }); $('#photoName').textContent = `現在: ${f.name}` }
+    r.readAsDataURL(f)
+  })
+  $('#photoReset').addEventListener('click', () => { send({ type: 'image', dataUrl: null }); $('#photoName').textContent = '現在: 自動生成のサンプル'; $('#photo').value = '' })
+
+  // ---- polling
+  async function poll() {
+    try {
+      const s = await (await fetch('/__emu/state')).json()
+      const app = s.app ?? {}
+      $('#conn').classList.toggle('on', s.connected)
+      $('#connText').textContent = s.connected ? 'アプリ接続中' : 'アプリ未接続（シミュレーターで開いてください）'
+      $('#capture').textContent = `入力先: ${app.capture ? `${app.capture.kind === 'list' ? 'リスト' : 'テキスト'} "${app.capture.name}"` : '—'}`
+      const imu = app.imu?.on ? `ON ${app.imu.pace}ms` : 'OFF'
+      const mic = app.audio?.on ? `ON (${app.audio.source})` : 'OFF'
+      const loc = app.location?.updating ? `連続 ${app.location.intervalMs}ms` : 'OFF'
+      $('#sensors').textContent = `IMU: ${imu} / マイク: ${mic} / 位置: ${loc}`
+      $('#state').textContent = JSON.stringify(app, null, 2)
+      renderMenu(app.menu)
+    } catch {
+      $('#conn').classList.remove('on')
+      $('#connText').textContent = '開発サーバーに接続できません'
+    }
+  }
+  setInterval(poll, 700)
+  poll()
+
+  async function refreshShot() {
+    if ($('#live').checked && document.visibilityState === 'visible') {
+      const t = performance.now()
+      const img = $('#shot')
+      await new Promise(res => { img.onload = img.onerror = res; img.src = `/__emu/screenshot?t=${Date.now()}` })
+      $('#shotInfo').textContent = img.naturalWidth ? `${Math.round(performance.now() - t)}ms` : 'シミュレーター（--automation-port 9898）が見つかりません'
+    }
+    setTimeout(refreshShot, 400)
+  }
+  refreshShot()
+</script>
+</body>
+</html>

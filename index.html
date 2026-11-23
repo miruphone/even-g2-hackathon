@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
-    <title>Even Hub Minimal</title>
+    <title>G2 機能デモ</title>
     <style>
       html, body {
         margin: 0;
@@ -11,7 +11,7 @@
         /* ER brand dark-theme surface (#232323) + Neutral-200 text (#E5E5E5). */
         background: #232323;
         color: #E5E5E5;
-        font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
         /* Kill WebView zoom + iOS auto-sizing + rubber-band scroll. */
         touch-action: manipulation;
         -webkit-text-size-adjust: 100%;
@@ -19,17 +19,29 @@
       }
       #app {
         display: flex;
+        flex-direction: column;
         height: 100%;
-        align-items: center;
-        justify-content: center;
-        padding: 24px;
+        padding: 16px;
         box-sizing: border-box;
-        text-align: center;
+        gap: 12px;
       }
+      header { display: flex; align-items: baseline; gap: 8px; }
+      h1 { font-size: 16px; margin: 0; font-weight: 600; }
+      #screen { color: #9ae6a0; font-weight: 600; }
+      .card { background: #2c2c2c; border-radius: 10px; padding: 10px 12px; }
+      .label { font-size: 11px; color: #a3a3a3; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+      #status { white-space: pre-wrap; margin: 0; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 1.5em; }
+      .log-card { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+      #log { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: #cfcfcf; }
+      #log li { border-bottom: 1px solid #363636; padding: 2px 0; word-break: break-all; }
     </style>
   </head>
   <body>
-    <div id="app">Companion app is running. Check the glasses display.</div>
+    <div id="app">
+      <header><h1>G2 機能デモ</h1><span id="screen">起動中…</span></header>
+      <div class="card"><div class="label">状態</div><pre id="status"></pre></div>
+      <div class="card log-card"><div class="label">イベントログ</div><ul id="log"></ul></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
