@@ -1,5 +1,5 @@
 {
-  "name": "g2-feature-demo",
+  "name": "warden-g2",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -9,10 +9,15 @@
     "preview": "vite preview",
     "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.16",
     "simulate": "evenhub-simulator http://localhost:5173 --automation-port 9898",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json",
+    "server": "node --env-file-if-exists=.env server/index.ts",
+    "tgmock": "node tools/tgmock/server.ts",
+    "server:mock": "node --env-file-if-exists=.env --env-file=.env.mock server/index.ts"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "^0.0.16"
+    "@anthropic-ai/sdk": "^1.13.0",
+    "@evenrealities/even_hub_sdk": "^0.0.16",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.2.0",

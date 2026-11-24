@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Telegram Mock</title>
+<style>
+  :root { --bg:#0e1621; --panel:#17212b; --line:#243241; --text:#e6edf3; --dim:#8b98a5; --accent:#5ea6e8; --bad:#e86a5e; --ok:#6bd08a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0 12px 0 0; }
+  button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+  input { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font:inherit; width:150px; }
+  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; padding:12px 16px; }
+  .chat { background:var(--panel); border-radius:12px; display:flex; flex-direction:column; min-height:420px; max-height:70vh; }
+  .chat h2 { font-size:14px; margin:0; padding:10px 12px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; }
+  .msgs { flex:1; overflow-y:auto; padding:8px 12px; display:flex; flex-direction:column; gap:6px; }
+  .m { background:#202b36; border-radius:10px; padding:6px 9px; word-break:break-word; }
+  .m b { color:var(--accent); font-weight:600; margin-right:6px; }
+  .m.bot { background:#1f3346; }
+  .m.del { opacity:.45; text-decoration:line-through; }
+  .m.sys { background:none; color:var(--dim); padding:0 2px; font-size:12px; }
+  .members { border-top:1px solid var(--line); padding:8px 12px; font-size:12px; color:var(--dim); }
+  .tag { display:inline-block; padding:0 6px; border-radius:6px; margin:2px 4px 0 0; background:#202b36; }
+  .tag.kicked { color:var(--bad); } .tag.restricted { color:#e8c05e; } .tag.declined { color:var(--bad); } .tag.approved { color:var(--ok); }
+  .locked { color:#e8c05e; font-size:12px; }
+  footer { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:0 16px 16px; }
+  pre { background:var(--panel); border-radius:12px; padding:10px 12px; margin:0; font-size:12px; white-space:pre-wrap; max-height:200px; overflow:auto; color:var(--dim); }
+  @media (max-width: 700px) { footer { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Telegram mock</h1>
+  <span id="scenarios"></span>
+  <input id="dm" placeholder="/pair 123456" />
+  <button id="send">DM bot as admin</button>
+</header>
+<main id="chats"></main>
+<footer><pre id="dms"></pre><pre id="log"></pre></footer>
+<script>
+const $ = id => document.getElementById(id)
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+let built = false
+async function tick() {
+  let s
+  try { s = await (await fetch('/mock/state')).json() } catch { return }
+  if (!built) {
+    built = true
+    $('scenarios').innerHTML = Object.entries(s.scenarios).map(([k, t]) => `<button data-s="${k}">${esc(t)}</button>`).join(' ')
+    $('scenarios').onclick = e => { const k = e.target.dataset.s; if (k) fetch('/mock/scenario/' + k, { method: 'POST' }) }
+  }
+  $('chats').innerHTML = s.chats.map(c => `
+    <section class="chat">
+      <h2><span>${esc(c.title)}</span>${c.locked ? '<span class="locked">🔒 locked</span>' : ''}</h2>
+      <div class="msgs">${c.messages.map(m => m.text === '→ joined'
+        ? `<div class="m sys">${esc(m.from)} joined</div>`
+        : `<div class="m ${m.bot ? 'bot' : ''} ${m.deleted ? 'del' : ''}"><b>${esc(m.from)}</b>${esc(m.text)}</div>`).join('')}</div>
+      <div class="members">${c.members.map(m => `<span class="tag ${m.status}">${esc(m.name)} · ${m.status}</span>`).join('')}
+        ${c.joinRequests.map(j => `<span class="tag ${j.state}">req: ${esc(j.name)} · ${j.state}</span>`).join('')}</div>
+    </section>`).join('')
+  for (const el of document.querySelectorAll('.msgs')) el.scrollTop = el.scrollHeight
+  $('dms').textContent = 'DMs with the bot\n' + s.dms.map(d => `${d.from}: ${d.text}`).join('\n\n')
+  $('log').textContent = 'Bot API log\n' + s.log.slice().reverse().join('\n')
+}
+$('send').onclick = async () => {
+  const text = $('dm').value.trim()
+  if (!text) return
+  await fetch('/mock/dm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) })
+  $('dm').value = ''
+}
+setInterval(tick, 800)
+tick()
+</script>
+</body>
+</html>

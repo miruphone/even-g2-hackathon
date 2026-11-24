@@ -1,152 +1,355 @@
+// Warden on the glasses. Four views, one gesture vocabulary:
+//   card    an incident: verdict + evidence, actions as a list (swipe picks, tap does)
+//   idle    "All quiet" with today's numbers
+//   recent  what was done, newest first
+//   pair    the code to send to the bot
+// Hold (long press) undoes the last action while its 5 s window is open.
+
 import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
-import { enqueue, initGlasses, renderPage, setText, type MenuItem, type PageSpec } from './core/bridge'
-import { GESTURE_LABEL, SOURCE_LABEL, parseEvent, type Input } from './core/input'
-import { log, setScreenTitle, setStatus } from './core/log'
-import { createMenuScreen } from './screens/menu'
-import type { AppState, Screen, ScreenContext, ScreenFactory } from './screens/types'
-import { createInputScreen } from './screens/input'
-import { createTextScreen } from './screens/text'
-import { createListScreen } from './screens/list'
-import { createImageScreen } from './screens/image'
-import { createMicScreen } from './screens/mic'
-import { createImuScreen } from './screens/imu'
-import { createLocationScreen } from './screens/location'
-import { createPhotoScreen } from './screens/photo'
-import { createDeviceScreen } from './screens/device'
-import { createStorageScreen } from './screens/storage'
+import { Api, Unauthorized, type Card, type Feed } from './api'
+import { enqueue, initGlasses, renderPage, setText, type ContainerSpec, type MenuItem } from './core/bridge'
+import { parseEvent, type Input } from './core/input'
+import { log } from './core/log'
+import { renderPhone } from './phone'
 
-const LONG_PRESS_BACK_MS = 1200
-const MENU_BACK_ID = 1
+const W = 576
+const H = 288
+const HDR = { id: 1, name: 'hdr' } as const
+const CLK = { id: 5, name: 'clk' } as const
+const BODY = { id: 2, name: 'body' } as const
+const FTR = { id: 3, name: 'ftr' } as const
+const ACTIONS = { id: 4, name: 'actions' } as const
 
-const FEATURES: ScreenFactory[] = [
-  createInputScreen,
-  createTextScreen,
-  createListScreen,
-  createImageScreen,
-  createMicScreen,
-  createImuScreen,
-  createLocationScreen,
-  createPhotoScreen,
-  createDeviceScreen,
-  createStorageScreen,
-]
+const MENU_UNDO = 11
+const MENU_AUTOMUTE = 12
+const MENU_RECENT = 13
+const MENU_UNPAIR = 14
 
-/**
- * Register one-shot / early host pushes. onLaunchSource fires exactly once,
- * right after the page loads, so this must run before any other await.
- */
-export function listenEarly(bridge: EvenAppBridge): AppState {
-  const state: AppState = { deviceStatusUpdates: 0 }
-  bridge.onLaunchSource(source => {
-    state.launchSource = source
-    log(`起動元: ${source}`)
-  })
-  bridge.onDeviceStatusChanged(status => {
-    state.deviceStatus = status
-    state.deviceStatusUpdates++
-    log(`端末状態: ${status.connectType} 電池${status.batteryLevel ?? '—'}% 装着=${status.isWearing ?? '—'}`)
-  })
-  return state
+const KIND_LABEL: Record<Card['kind'], string> = {
+  scam: 'SCAM',
+  impersonation: 'IMPERSONATOR',
+  spam: 'SPAM',
+  flood: 'FLOOD',
+  join: 'JOIN REQUEST',
+  raid: 'RAID',
 }
 
-export async function startApp(bridge: EvenAppBridge, state: AppState) {
+type View = 'boot' | 'pair' | 'idle' | 'card' | 'recent'
+
+interface Toast {
+  text: string
+  until: number
+  undoable?: boolean
+}
+
+export async function startApp(bridge: EvenAppBridge) {
   initGlasses(bridge)
+  const api = new Api()
 
-  let current: Screen | null = null
-  let menu: Screen
-  let longPressStartedAt = 0
-  let exiting = false
+  let feed: Feed | null = null
+  let online = true
+  let view: View = 'boot'
+  let signature = ''
+  let card: Card | null = null
+  let toast: Toast | null = null
+  let showRecent = false
+  const acting = new Set<string>()
+  // Cards acted on from these glasses whose result has not been shown yet.
+  const awaiting = new Set<string>()
 
-  const ctx: ScreenContext = {
-    state,
-    render(spec: PageSpec) {
-      const actions = current?.actions ?? []
-      const items: MenuItem[] = current === menu ? [] : [{ id: MENU_BACK_ID, label: 'メニューへ戻る' }]
-      items.push(...actions.map(a => ({ id: a.id, label: a.label })))
-      return renderPage({ ...spec, menu: items.length ? items.slice(0, 10) : undefined })
-    },
-    setText,
-    status: setStatus,
-    log,
-    back: () => open(menu),
-    open: screen => open(screen),
+  // ---------------------------------------------------------------- text helpers
+
+  const clock = () => {
+    const d = new Date()
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  }
+  const sev = (n: number) => '■'.repeat(n) + '□'.repeat(4 - n)
+  const ago = (t: number) => {
+    const s = Math.max(0, Math.round((Date.now() - t) / 1000))
+    return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`
   }
 
-  async function open(next: Screen) {
-    if (current === next) return
-    const prev = current
-    current = next
-    if (prev?.leave) await prev.leave().catch(e => log(`leave 失敗: ${String(e)}`))
-    setScreenTitle(next.title)
-    setStatus([])
-    log(`画面: ${next.title}`)
-    await next.enter().catch(e => log(`画面の表示に失敗: ${String(e)}`))
+  const openCards = () => (feed?.queue ?? []).filter(c => c.status === 'open' && !acting.has(c.id))
+
+  function toastText(): string | null {
+    if (!toast || toast.until <= Date.now()) return null
+    return toast.undoable ? `${toast.text}  ·  hold to undo ${Math.ceil((toast.until - Date.now()) / 1000)}s` : toast.text
   }
 
-  async function cleanupAndExit(reason: string) {
-    if (exiting) return
-    exiting = true
-    log(`終了処理 (${reason})`)
-    await current?.leave?.().catch(() => undefined)
-    unsubscribe()
+  function headerText(): string {
+    if (!online) return 'WARDEN  ·  reconnecting…'
+    const t = toastText()
+    if (t) return t
+    if (view === 'card' && card) {
+      const n = openCards().length
+      return `${sev(card.severity)} ${KIND_LABEL[card.kind]}${n > 1 ? `   1/${n}` : ''}`
+    }
+    if (view === 'pair') return 'WARDEN  ·  pair with Telegram'
+    const groups = feed?.groups.length ?? 0
+    return `WARDEN ● on watch · ${groups} group${groups === 1 ? '' : 's'}`
   }
+
+  /** Right side of the header: clock, or the auto-mute tag on a card. Hidden under a long toast. */
+  function cornerText(): string {
+    if (toastText()) return ' '
+    if (view === 'card' && card?.autoMuted) return 'auto-muted'
+    return `      ${clock()}`
+  }
+
+  function updateHeader() {
+    setText(HDR.id, HDR.name, headerText())
+    setText(CLK.id, CLK.name, cornerText())
+  }
+
+  // ---------------------------------------------------------------- views
+
+  function header(): ContainerSpec[] {
+    return [
+      { kind: 'text', ...HDR, x: 0, y: 0, w: 456, h: 32, content: headerText(), brightness: 4, padding: 4 },
+      { kind: 'text', ...CLK, x: 456, y: 0, w: W - 456, h: 32, content: cornerText(), brightness: 2, padding: 4 },
+    ]
+  }
+
+  function menu(): MenuItem[] {
+    return [
+      { id: MENU_UNDO, label: 'Undo last action' },
+      { id: MENU_AUTOMUTE, label: feed?.autoMute ? 'Auto-mute: ON' : 'Auto-mute: OFF' },
+      { id: MENU_RECENT, label: 'Recent actions' },
+      { id: MENU_UNPAIR, label: 'Unpair' },
+    ]
+  }
+
+  function cardBody(c: Card): string {
+    const lines = [c.title, c.detail]
+    const sig = c.signals.filter(s => s !== c.title).slice(0, 2).join(' · ')
+    // Three lines fit above the action list.
+    if (sig || c.ai) lines.push([sig, c.ai].filter(Boolean).join(' · '))
+    return lines.join('\n')
+  }
+
+  function idleBody(f: Feed): string {
+    const lines = ['', '            All quiet', '']
+    lines.push(`   ${f.stats.scanned.toLocaleString('en-US')} messages checked in ${f.groups.length} group${f.groups.length === 1 ? '' : 's'}`)
+    lines.push(`   Handled ${f.stats.handled} · auto-mute ${f.autoMute ? 'ON' : 'OFF'}`)
+    const last = f.recent[0]
+    if (last?.resolution) lines.push('', `   Last: ${last.resolution.summary.slice(0, 38)} (${ago(last.resolution.at)})`)
+    if (f.groups.length === 0) lines.push('', '   Add the bot to a group as admin')
+    else if (f.groups.some(g => !g.rights)) lines.push('', '   ! Bot lacks rights in a group')
+    return lines.join('\n')
+  }
+
+  function pairBody(f: Feed | null, code: string): string {
+    const bot = f?.bot ? `@${f.bot}` : 'the Warden bot'
+    return [
+      '1  Add ' + bot + ' to your group as admin',
+      '2  Send this to the bot in Telegram:',
+      '',
+      `          /pair ${code}`,
+      '',
+      'Or tap "Open Telegram" on your phone.',
+    ].join('\n')
+  }
+
+  async function render(force = false) {
+    const f = feed
+    let next: View
+    if (!f) next = 'boot'
+    else if (!f.paired) next = 'pair'
+    else if (showRecent) next = 'recent'
+    else next = openCards().length ? 'card' : 'idle'
+
+    card = next === 'card' ? openCards()[0] : null
+    let sig: string
+    let containers: ContainerSpec[]
+
+    if (next === 'card' && card) {
+      sig = `card:${card.id}:${card.title}:${card.detail}:${card.signals.join()}:${card.ai}:${card.actions.map(a => a.id).join()}`
+      containers = [
+        ...header(),
+        { kind: 'text', ...BODY, x: 0, y: 32, w: W, h: 92, content: cardBody(card), border: 1, borderColor: 8, radius: 6, padding: 4 },
+        { kind: 'list', ...ACTIONS, x: 0, y: 126, w: W, h: H - 126, items: card.actions.map(a => `▶ ${a.label}`), capture: true, selectBorder: true, padding: 0 },
+      ]
+    } else if (next === 'recent' && f) {
+      const items = f.recent.length
+        ? f.recent.map(c => `${c.resolution?.action === 'dismiss' ? '○' : '●'} ${c.title.slice(0, 22)} - ${c.resolution?.summary ?? ''}`.slice(0, 60))
+        : ['Nothing yet']
+      sig = `recent:${items.join('|')}`
+      containers = [
+        ...header(),
+        { kind: 'list', ...ACTIONS, x: 0, y: 36, w: W, h: H - 36 - 30, items: items.slice(0, 20), capture: true, selectBorder: true, padding: 2 },
+        { kind: 'text', ...FTR, x: 0, y: H - 30, w: W, h: 30, content: 'Tap: back', brightness: 2, padding: 4 },
+      ]
+    } else if (next === 'pair') {
+      sig = `pair:${f?.code}:${f?.bot}`
+      containers = [
+        ...header(),
+        { kind: 'text', ...BODY, x: 0, y: 36, w: W, h: 216, content: pairBody(f, f?.code ?? '······'), border: 1, borderColor: 8, radius: 6, padding: 12, capture: true },
+        { kind: 'text', ...FTR, x: 0, y: H - 34, w: W, h: 34, content: 'Waiting for Telegram…', brightness: 2, padding: 4 },
+      ]
+    } else if (next === 'idle' && f) {
+      sig = 'idle'
+      containers = [
+        ...header(),
+        { kind: 'text', ...BODY, x: 0, y: 36, w: W, h: 216, content: idleBody(f), border: 1, borderColor: 5, radius: 6, padding: 8, capture: true },
+        { kind: 'text', ...FTR, x: 0, y: H - 34, w: W, h: 34, content: 'Tap: recent  ·  Hold: undo  ·  Double: exit', brightness: 2, padding: 4 },
+      ]
+    } else {
+      sig = 'boot'
+      containers = [
+        ...header(),
+        { kind: 'text', ...BODY, x: 0, y: 36, w: W, h: 252, content: '\n\n            Connecting to Warden…', capture: true, padding: 8 },
+      ]
+    }
+
+    view = next
+    if (force || sig !== signature) {
+      signature = sig
+      await renderPage({ containers, menu: menu() })
+    } else {
+      updateHeader()
+      if (next === 'idle' && f) setText(BODY.id, BODY.name, idleBody(f))
+    }
+    renderPhone(feed, online, api.token)
+  }
+
+  // ---------------------------------------------------------------- actions
+
+  function flash(text: string, ms = 2500, undoable = false) {
+    toast = { text, until: Date.now() + ms, undoable }
+    updateHeader()
+  }
+
+  async function act(c: Card, index: number) {
+    const a = c.actions[index]
+    if (!a || acting.has(c.id)) return
+    acting.add(c.id)
+    log(`act ${a.id} on ${c.id} (${c.title})`)
+    // Optimistic: move to the next card now; the backend confirms within the long poll.
+    if (a.id === 'later') flash('Moved to the back of the queue', 1500)
+    else {
+      flash(`▶ ${a.label}`, 5000, true)
+      awaiting.add(c.id)
+    }
+    void render()
+    try {
+      const r = await api.act(c.id, a.id)
+      if (!r.ok) {
+        acting.delete(c.id)
+        awaiting.delete(c.id)
+        flash(`Failed: ${r.error ?? 'unknown error'}`)
+        void render()
+      }
+    } catch (e) {
+      acting.delete(c.id)
+      awaiting.delete(c.id)
+      flash('Failed: network error')
+      log(`act failed: ${String(e)}`)
+      void render()
+    }
+  }
+
+  async function undo() {
+    try {
+      const r = await api.undo()
+      if (r.ok) {
+        if (r.id) {
+          acting.delete(r.id)
+          awaiting.delete(r.id)
+        }
+        flash('◀ Undone')
+      } else flash('Nothing to undo')
+    } catch {
+      flash('Undo failed: network error')
+    }
+    void render()
+  }
+
+  // ---------------------------------------------------------------- input
 
   function handle(input: Input) {
-    if (!current) return
-
-    if (input.kind === 'gesture') {
-      if (input.gesture !== 'up' && input.gesture !== 'down') {
-        log(`入力: ${GESTURE_LABEL[input.gesture]} (${SOURCE_LABEL[input.source]}, ${input.via}${input.listIndex !== undefined ? ` #${input.listIndex}` : ''})`)
-      }
-      // Let the screen see every gesture first (the input screen logs them all).
-      current.onInput?.(input)
-
-      if (input.gesture === 'double') {
-        // Root-level rule: double tap always offers to exit, on every screen.
-        void enqueue('shutDownPageContainer', () => bridge.shutDownPageContainer(1))
-        return
-      }
-      if (input.gesture === 'longStart') {
-        longPressStartedAt = Date.now()
-        return
-      }
-      if (input.gesture === 'longEnd') {
-        const held = longPressStartedAt ? Date.now() - longPressStartedAt : 0
-        longPressStartedAt = 0
-        if (held >= LONG_PRESS_BACK_MS && current !== menu) open(menu)
-        return
-      }
-      return
-    }
-
-    if (input.kind === 'menu') {
-      log(`メニュー選択: ${input.itemId}`)
-      if (input.itemId === MENU_BACK_ID) {
-        open(menu)
-        return
-      }
-      const action = current.actions?.find(a => a.id === input.itemId)
-      if (action) void Promise.resolve(action.run()).catch(e => log(`操作に失敗: ${String(e)}`))
-      return
-    }
-
     if (input.kind === 'lifecycle') {
-      log(`ライフサイクル: ${input.type}`)
-      if (input.type === 'foregroundEnter') void current.render()
-      if (input.type === 'abnormalExit' || input.type === 'systemExit') void cleanupAndExit(input.type)
+      if (input.type === 'foregroundEnter') void render(true)
       return
     }
-
-    // imu / audio frames go straight to the screen.
-    current.onInput?.(input)
+    if (input.kind === 'menu') {
+      if (input.itemId === MENU_UNDO) void undo()
+      if (input.itemId === MENU_AUTOMUTE && feed) {
+        const on = !feed.autoMute
+        feed.autoMute = on
+        flash(`Auto-mute ${on ? 'ON' : 'OFF'}`)
+        void api.setAutoMute(on).then(() => render(true))
+      }
+      if (input.itemId === MENU_RECENT) {
+        showRecent = true
+        void render()
+      }
+      if (input.itemId === MENU_UNPAIR) void api.logout().then(() => location.reload())
+      return
+    }
+    if (input.kind !== 'gesture') return
+    if (input.gesture === 'double') {
+      void enqueue('shutDownPageContainer', () => bridge.shutDownPageContainer(1))
+      return
+    }
+    if (input.gesture === 'longStart') {
+      void undo()
+      return
+    }
+    if (input.gesture !== 'tap') return
+    if (view === 'card' && card && input.via === 'list') void act(card, input.listIndex ?? 0)
+    else if (view === 'recent') {
+      showRecent = false
+      void render()
+    } else if (view === 'idle') {
+      showRecent = true
+      void render()
+    }
   }
 
-  const unsubscribe = bridge.onEvenHubEvent(event => {
+  bridge.onEvenHubEvent(event => {
     const input = parseEvent(event)
     if (input) handle(input)
   })
 
-  const features = FEATURES.map(f => f(ctx))
-  menu = createMenuScreen(ctx, features)
-  await open(menu)
+  // Header clock and undo countdown.
+  setInterval(() => {
+    if (toast && toast.until < Date.now() - 1000) toast = null
+    if (view !== 'boot') updateHeader()
+  }, 1000)
+
+  // ---------------------------------------------------------------- feed loop
+
+  await render(true)
+  if (!(await api.loadToken())) await api.pair().catch(e => log(`pair failed: ${String(e)}`))
+  let rev = 0
+  for (;;) {
+    try {
+      const f = await api.feed(rev)
+      online = true
+      rev = f.rev
+      feed = f
+      // Cards the backend now reports as pending/resolved no longer need the local guard.
+      for (const id of [...acting]) if (!f.queue.some(c => c.id === id && c.status === 'open')) acting.delete(id)
+      // Once the 5 s window closes, show what Telegram actually did.
+      for (const c of f.recent) {
+        if (awaiting.has(c.id) && c.resolution) {
+          awaiting.delete(c.id)
+          flash(c.resolution.summary, 3500)
+        }
+      }
+      await render()
+    } catch (e) {
+      if (e instanceof Unauthorized) {
+        log('session unknown, pairing again')
+        await api.pair().catch(() => undefined)
+        rev = 0
+        continue
+      }
+      if (online) log(`feed failed: ${String(e)}`)
+      online = false
+      updateHeader()
+      renderPhone(feed, online, api.token)
+      await new Promise(r => setTimeout(r, 2000))
+    }
+  }
 }

@@ -1,35 +1,21 @@
 {
-  "package_id": "com.example.evenhubminimal",
+  "package_id": "app.warden.g2",
   "edition": "202601",
-  "name": "G2 Feature Demo",
+  "name": "Warden",
   "version": "0.1.0",
   "min_app_version": "2.2.10",
   "min_sdk_version": "0.0.16",
   "entrypoint": "index.html",
   "permissions": [
     {
-      "name": "g2-microphone",
-      "desc": "Shows a live volume meter from the glasses microphones."
-    },
-    {
-      "name": "phone-microphone",
-      "desc": "Shows a live volume meter from the phone microphone."
-    },
-    {
-      "name": "location",
-      "desc": "Shows the current position and distance walked."
-    },
-    {
-      "name": "camera",
-      "desc": "Takes a photo with the phone and shows it on the glasses."
-    },
-    {
-      "name": "album",
-      "desc": "Picks a photo from the phone album and shows it on the glasses."
+      "name": "network",
+      "desc": "Talks to the Warden backend, which watches your Telegram groups and runs your moderation actions.",
+      "whitelist": [
+        "https://warden-api.example.com"
+      ]
     }
   ],
   "supported_languages": [
-    "ja",
     "en"
   ]
 }
