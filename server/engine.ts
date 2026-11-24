@@ -533,7 +533,7 @@ export class Engine {
         const k = key(chatId, userId)
         this.owned.set(k, ++this.generation)
         this.lifts.delete(k) // a new mute supersedes any pending lift
-        this.save()
+        this.saveNow() // ownership must survive a restart, or the mute could never be lifted
         return 'muted' as const
       } catch (e) {
         console.warn('[engine] mute failed', errText(e))
@@ -565,7 +565,7 @@ export class Engine {
       } catch (e) {
         console.warn('[engine] unmute failed, will retry:', errText(e))
         this.lifts.set(k, target)
-        this.save()
+        this.saveNow() // the retry must survive an immediate restart
         setTimeout(() => void this.liftMute(chatId, userId, target, Math.min(delay * 2, LIFT_RETRY_MAX_MS)), delay).unref()
         return false
       }
@@ -1163,6 +1163,7 @@ export class Engine {
     let removed = 0
     let banned = 0
     let already = 0
+    let lifted = 0
     const action = p.action
     if (action === 'ban' || action === 'ban_warn') {
       for (const [chatId, users] of scope) {
@@ -1229,7 +1230,9 @@ export class Engine {
         let all = true
         for (const u of users.keys()) {
           const k = key(chatId, u)
-          if (i.autoMuted.has(k)) {
+          // "Trust" lifts every mute Warden holds on this member here: automatic,
+          // or left by an earlier action on this card (e.g. a Mute whose delete failed).
+          if (i.autoMuted.has(k) || this.owned.has(k)) {
             // Lifting a mute is a restrict operation: the admin needs that right too.
             if (!(await this.stillAllowed(chatId, p.by, 'restrict'))) {
               errors.push('no ban right to lift the mute')
@@ -1242,6 +1245,7 @@ export class Engine {
               continue
             }
             i.autoMuted.delete(k)
+            lifted++
           }
           this.trusted.add(k)
           okPairs.add(k)
@@ -1296,7 +1300,7 @@ export class Engine {
       if (muted) parts.push(`Muted 24h in ${plural(chats, 'group')}`)
       if (already) parts.push(`${already} already restricted`)
       if (removed) parts.push(`${plural(removed, 'msg')} removed`)
-    } else if (action === 'dismiss') parts.push(i.kind === 'raid' || i.kind === 'join' ? 'Ignored' : i.autoMuted.size || errors.length ? 'Trusted' : 'Trusted, mute lifted')
+    } else if (action === 'dismiss') parts.push(i.kind === 'raid' || i.kind === 'join' ? 'Ignored' : lifted ? 'Trusted, mute lifted' : 'Trusted')
     else if (action === 'approve') parts.push('Approved')
     else if (action === 'decline') parts.push('Declined')
     else if (action === 'lock') parts.push('Group locked 10 min')

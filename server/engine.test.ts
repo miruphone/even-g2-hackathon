@@ -76,8 +76,10 @@ class FakeTelegram {
     this.members.set(`${chat}:${user}`, 'kicked')
     return true
   }
+  failDelete = false
   async deleteMessages(chat: number, ids: number[]) {
     if (ids.length < 1 || ids.length > 100) throw new RangeError('bad batch')
+    if (this.failDelete) throw new Error('message can not be deleted')
     this.calls.push({ method: 'delete', chat, ids })
     return true
   }
@@ -547,9 +549,51 @@ test('a slow auto-mute that fails is not counted by a manual mute', async () => 
   await t.join(A, x)
   await t.say(A, x, DRAINER) // auto-mute in flight
   const card = t.engine.feed(alice)!.queue[0]
-  await t.engine.act(alice, card.id, 'mute')
+  assert.equal((await t.engine.act(alice, card.id, 'mute')).ok, true, 'the manual action was accepted')
   await tick(250)
   const after = t.engine.feed(alice)!
   assert.equal(after.recent.length, 0)
   assert.equal(after.queue[0]?.status, 'open')
+  assert.ok(after.queue[0]?.error, 'the failure is reported')
+})
+
+test('Dismiss lifts a mute left behind by a partial Mute', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  t.engine.setAutoMute(alice, false)
+  const x = user(84, 'Spammy', 'spammy5')
+  await t.join(A, x)
+  await t.say(A, x, SPAM)
+  let card = t.engine.feed(alice)!.queue[0]
+  t.tg.failDelete = true
+  await t.engine.act(alice, card.id, 'mute')
+  await tick(150)
+  card = t.engine.feed(alice)!.queue[0]
+  assert.equal(card.status, 'open', 'mute applied, delete failed: still open')
+  assert.equal(t.tg.members.get(`${A}:84`), 'restricted')
+  t.tg.failDelete = false
+  await t.engine.act(alice, card.id, 'dismiss')
+  await tick(150)
+  assert.equal(t.tg.members.get(`${A}:84`), 'member', 'the mute was actually lifted')
+  assert.match(t.engine.feed(alice)!.recent[0].resolution!.summary, /mute lifted/)
+})
+
+test('a failing lift is persisted at once and resumed after a restart', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  t.engine.setAutoMute(alice, false)
+  const x = user(85, 'Spammy', 'spammy6')
+  await t.join(A, x)
+  await t.say(A, x, SPAM)
+  const card = t.engine.feed(alice)!.queue[0]
+  await t.engine.act(alice, card.id, 'mute')
+  await tick(5)
+  t.tg.failRestrict = true
+  await t.engine.undo(alice, card.id)
+  // Restart immediately (no time for a debounced save).
+  const tg2 = new FakeTelegram()
+  new Engine(tg2 as unknown as Telegram, t.file, { undoMs: 50, liftRetryMs: 30 })
+  await tick(1200)
+  const lift = tg2.calls.find(c => c.method === 'restrict' && c.user === 85)
+  assert.ok(lift && Object.values(lift.perms!).every(v => v === true), 'the new process lifts the mute')
 })
