@@ -31,6 +31,8 @@ interface MockChat {
 
 const OPEN = { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_video_notes: true, can_send_voice_notes: true, can_send_polls: true, can_send_other_messages: true, can_add_web_page_previews: true }
 
+const ALL_PERMISSIONS = { ...OPEN, can_change_info: true, can_invite_users: true, can_pin_messages: true, can_manage_topics: true }
+
 const chats = new Map<number, MockChat>()
 const users = new Map<number, TgUser>()
 const updates: TgUpdate[] = []
@@ -300,8 +302,8 @@ async function api(method: string, p: Record<string, unknown>): Promise<unknown>
       const m = c.members.get(userId)
       if (!m) throw new ApiError(400, 'Bad Request: user not found')
       const perms = p.permissions as Record<string, boolean>
-      // Like Telegram: only all-true permissions lift a restriction.
-      const muted = Object.keys(OPEN).some(k => perms[k] !== true)
+      // Like Telegram: only all-true permissions (every field) lift a restriction.
+      const muted = Object.keys(ALL_PERMISSIONS).some(k => perms[k] !== true)
       c.members.set(userId, { user: m.user, status: muted ? 'restricted' : 'member', until: muted ? Number(p.until_date ?? 0) || undefined : undefined })
       note(`${muted ? 'muted' : 'unmuted'} ${m.user.first_name} in ${c.chat.title}`)
       return true

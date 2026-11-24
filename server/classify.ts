@@ -22,6 +22,7 @@ export interface ReviewInput {
   senderUsername?: string
   minutesSinceJoin?: number
   signals: string[]
+  links: string[] // every URL, including hidden text links and buttons
   text: string
 }
 
@@ -80,7 +81,7 @@ export async function review(input: ReviewInput, cacheKey?: string): Promise<Ver
       messages: [
         {
           role: 'user',
-          content: `Group: ${input.groupTitle}\nSender: ${sender}\nRule signals: ${input.signals.join(', ') || 'none'}\n\n<message>\n${input.text.slice(0, 2000)}\n</message>`,
+          content: `Group: ${input.groupTitle}\nSender: ${sender}\nRule signals: ${input.signals.join(', ') || 'none'}\nLinks (including hidden ones): ${input.links.slice(0, 10).join(' ') || 'none'}\n\n<message>\n${input.text.slice(0, 2000)}\n</message>`,
         },
       ],
     })

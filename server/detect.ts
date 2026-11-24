@@ -52,7 +52,8 @@ const SEED_WARNING = /\b(never|don'?t|do not|not|no one|nobody)\b[^.!?\n]{0,24}\
 const DM_BAIT = /\b(dm me|message me|inbox me|pm me|write (to )?me|contact me|text me|hit me up)\b/i
 const INVEST = /\b(guaranteed|100x|x100|1000x|double your|daily profit|profit daily|signals? (group|channel)|returns? of \d+%|risk[- ]free)\b/i
 const SUPPORT = /\b((official|technical|customer) support|help ?desk|admin here|i am (an |the )?admin|support team|wallet support)\b/i
-const STAFF_WORDS = /(admin|support|official|moderator|\bmod\b|team|helpdesk)/i
+// Tolerates the usual swaps (admln, adm1n, supp0rt) that clones use to dodge exact matches.
+const STAFF_WORDS = /(adm[i1l|!]n|supp[o0]rt|[o0]ff[i1l]c[i1l]a[l1i]|m[o0]derat[o0]r|\bm[o0]d\b|team|he[l1]p ?desk)/i
 const STAFF_WORDS_G = new RegExp(STAFF_WORDS.source, 'gi')
 const ADDRESS = /\b(0x[a-fA-F0-9]{40}|(EQ|UQ)[A-Za-z0-9_-]{46}|bc1[a-z0-9]{25,60}|T[1-9A-HJ-NP-Za-km-z]{33})\b/
 
@@ -122,10 +123,21 @@ export function adminHandle(a: AdminRef): string {
   return a.username ? '@' + a.username : a.first_name
 }
 
-/** Exact text identity (case and spacing folded). URLs and numbers are kept, so different links never match. */
-export function fingerprintOf(text: string): string {
-  const norm = text.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 500)
-  return createHash('sha1').update(norm).digest('hex').slice(0, 16)
+/**
+ * Exact evidence identity: the full text (spacing folded, case kept so URL paths
+ * stay distinct) plus hidden link and button URLs. Different links never match.
+ */
+export function fingerprintOf(text: string, hiddenUrls: string[] = []): string {
+  const norm = text.normalize('NFKC').replace(/\s+/g, ' ').trim()
+  return createHash('sha256').update(norm).update('\u0000').update(hiddenUrls.join('\u0000')).digest('hex').slice(0, 24)
+}
+
+/** Signals that only say "this text was repeated", not that this sender did anything wrong. */
+export const REPETITION_CODES = new Set(['cross', 'copies'])
+
+/** A seed-phrase request, judged per sentence so a warning elsewhere cannot hide it. */
+function asksForSeed(text: string): boolean {
+  return text.split(/[.!?\n]+/).some(clause => SEED_ASK.test(clause) && !SEED_WARNING.test(clause))
 }
 
 function urlsOf(text: string, entities: TgEntity[] | undefined, msg: TgMessage): string[] {
@@ -179,7 +191,7 @@ export function analyzeMessage(msg: TgMessage, ctx: MessageContext, now = Date.n
     if (host.startsWith('xn--') || host.includes('.xn--')) add('punycode', 'Look-alike domain', 3)
   }
   if (urls.length && LURE.test(text)) add('lure', 'Airdrop / claim bait', 3)
-  if (SEED_ASK.test(text) && !SEED_WARNING.test(text)) add('seed', 'Asks for seed phrase', 5)
+  if (asksForSeed(text)) add('seed', 'Asks for seed phrase', 5)
   if (dmBait) add('dm', 'Pulls users to DM', isNew ? 3 : 2)
   if (INVEST.test(text)) add('invest', 'Profit promise', 2)
   if (support) add('support', 'Fake support pitch', dmBait ? 3 : 2)
@@ -191,7 +203,9 @@ export function analyzeMessage(msg: TgMessage, ctx: MessageContext, now = Date.n
   let kind: Kind | null = null
   if (user) {
     const imp = impersonates(user, ctx.admins)
-    if (imp && (imp.strength !== 'name' || isNew || dmBait || support)) {
+    // A shared first name is common; it only counts with a staff-style name, a look-alike
+    // handle, or a support/DM pitch in the message itself.
+    if (imp && (imp.strength !== 'name' || dmBait || support)) {
       add('impersonation', `Clone of ${adminHandle(imp.admin)}`, 6)
       kind = 'impersonation'
     } else if (imp) {
@@ -214,7 +228,8 @@ export function analyzeMessage(msg: TgMessage, ctx: MessageContext, now = Date.n
     else kind = 'spam'
   }
   signals.sort((a, b) => b.weight - a.weight)
-  return { kind, score, signals, fingerprint: text ? fingerprintOf(text) : '', urls, text }
+  const hidden = urls.filter(u => !text.includes(u))
+  return { kind, score, signals, fingerprint: text || hidden.length ? fingerprintOf(text, hidden) : '', urls, text }
 }
 
 export interface JoinContext {
@@ -225,7 +240,8 @@ export interface JoinContext {
 export function analyzeJoin(user: TgUser, ctx: JoinContext): Analysis {
   const { signals, add } = collector()
   const imp = impersonates(user, ctx.admins)
-  if (imp) add('impersonation', `Clone of ${adminHandle(imp.admin)}`, imp.strength === 'name' ? 4 : 6)
+  if (imp && imp.strength !== 'name') add('impersonation', `Clone of ${adminHandle(imp.admin)}`, 6)
+  else if (imp) add('same_name', 'Same name as an admin', 1)
   else if (STAFF_WORDS.test([user.first_name, user.last_name, user.username].filter(Boolean).join(' '))) add('staff_name', 'Name poses as staff', 2)
   const bio = ctx.bio ?? ''
   if (/https?:\/\/|t\.me\//i.test(bio)) add('bio_link', 'Link in bio', 2)

@@ -90,7 +90,10 @@ export interface TgChatPermissions {
   can_send_polls?: boolean
   can_send_other_messages?: boolean
   can_add_web_page_previews?: boolean
+  can_change_info?: boolean
   can_invite_users?: boolean
+  can_pin_messages?: boolean
+  can_manage_topics?: boolean
 }
 
 export const MUTED: TgChatPermissions = {
@@ -106,8 +109,26 @@ export const MUTED: TgChatPermissions = {
   can_add_web_page_previews: false,
 }
 
-/** All permissions true: Telegram lifts the member's individual restriction (group defaults apply again). */
-export const ALL_ALLOWED: TgChatPermissions = Object.fromEntries(Object.keys(MUTED).map(k => [k, true])) as TgChatPermissions
+/**
+ * Every ChatPermissions field set to true. Telegram lifts a member's individual
+ * restriction only when all of them are true (group defaults apply again).
+ */
+export const ALL_ALLOWED: Required<TgChatPermissions> = {
+  can_send_messages: true,
+  can_send_audios: true,
+  can_send_documents: true,
+  can_send_photos: true,
+  can_send_videos: true,
+  can_send_video_notes: true,
+  can_send_voice_notes: true,
+  can_send_polls: true,
+  can_send_other_messages: true,
+  can_add_web_page_previews: true,
+  can_change_info: true,
+  can_invite_users: true,
+  can_pin_messages: true,
+  can_manage_topics: true,
+}
 
 export class TelegramError extends Error {
   readonly code: number

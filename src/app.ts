@@ -53,9 +53,12 @@ export async function startApp(bridge: EvenAppBridge) {
   let card: Card | null = null
   let toast: Toast | null = null
   let showRecent = false
-  const acting = new Set<string>()
+  // Cards hidden locally after a tap, until the backend reports on them.
+  // `acked` is set once the backend accepted the action.
+  const acting = new Map<string, { acked: boolean }>()
   // Cards acted on from these glasses whose result has not been shown yet.
-  const awaiting = new Set<string>()
+  // Action attempts started here whose outcome has not been shown yet: attempt -> card id.
+  const awaiting = new Map<string, string>()
 
   // ---------------------------------------------------------------- text helpers
 
@@ -246,49 +249,53 @@ export async function startApp(bridge: EvenAppBridge) {
     updateHeader()
   }
 
-  async function act(c: Card, index: number) {
-    const a = c.actions[index]
-    if (!a || acting.has(c.id)) return
-    acting.add(c.id)
-    log(`act ${a.id} on ${c.id} (${c.title})`)
+  /**
+   * Run the action in row `index` of the card as it is displayed. The action is
+   * looked up on the displayed card (rows can reorder in newer data) and then
+   * checked against the current card before anything is sent.
+   */
+  async function act(shown: Card, index: number) {
+    const a = shown.actions[index]
+    const current = openCards().find(x => x.id === shown.id)
+    if (!a || !current || acting.has(shown.id)) return
+    if (!current.actions.some(x => x.id === a.id)) {
+      flash('Card changed, look again')
+      void render(true)
+      return
+    }
+    acting.set(shown.id, { acked: false })
+    log(`act ${a.id} on ${shown.id} (${shown.title})`)
     // Optimistic: move to the next card now; the backend confirms within the long poll.
     if (a.id === 'later') flash('Moved to the back of the queue', 1500)
-    else {
-      flash(`▶ ${a.label}`, 5000, true)
-      awaiting.add(c.id)
-    }
+    else flash(`▶ ${a.label}`, 5000, true)
     void render()
     try {
-      const r = await api.act(c.id, a.id)
-      if (r.ok && a.id === 'later') {
-        acting.delete(c.id)
-        void render()
-      }
-      if (!r.ok) {
-        acting.delete(c.id)
-        awaiting.delete(c.id)
+      const r = await api.act(shown.id, a.id)
+      if (r.ok && r.attempt) {
+        awaiting.set(r.attempt, shown.id)
+        acting.set(shown.id, { acked: true })
+      } else if (r.ok) {
+        acting.delete(shown.id) // Later: show it again at its new place
+      } else {
+        acting.delete(shown.id)
         flash(`Failed: ${r.error ?? 'unknown error'}`)
-        void render()
       }
     } catch (e) {
-      acting.delete(c.id)
-      awaiting.delete(c.id)
+      acting.delete(shown.id)
       flash('Failed: network error')
       log(`act failed: ${String(e)}`)
-      void render()
     }
+    void render()
   }
 
   async function undo() {
     try {
       const r = await api.undo()
       if (r.ok) {
-        if (r.id) {
-          acting.delete(r.id)
-          awaiting.delete(r.id)
-        }
-        flash('◀ Undone')
-      } else flash('Nothing to undo')
+        if (r.id) acting.delete(r.id)
+        if (r.attempt) awaiting.delete(r.attempt)
+        flash(r.error ? `◀ Undone · ${r.error}` : '◀ Undone', r.error ? 4000 : 2500)
+      } else flash(r.error === 'nothing to undo' || !r.error ? 'Nothing to undo' : r.error)
     } catch {
       flash('Undo failed: network error')
     }
@@ -333,8 +340,7 @@ export async function startApp(bridge: EvenAppBridge) {
     }
     if (shownView === 'card' && input.via === 'list') {
       // Act only on the card the wearer is looking at, and only if it is still open.
-      const c = shownCard && openCards().find(x => x.id === shownCard!.id)
-      if (c) void act(c, input.listIndex ?? 0)
+      if (shownCard) void act(shownCard, input.listIndex ?? 0)
       else void render()
     } else if (shownView === 'recent') {
       showRecent = false
@@ -367,19 +373,23 @@ export async function startApp(bridge: EvenAppBridge) {
       online = true
       rev = f.rev
       feed = f
-      // Cards the backend now reports as pending/resolved no longer need the local guard.
-      for (const id of [...acting]) if (!f.queue.some(c => c.id === id && c.status === 'open')) acting.delete(id)
-      // Once the 5 s window closes, show what Telegram actually did.
+      // Once the backend has accepted an action, its view of the card is the truth:
+      // pending cards stay hidden, reopened ones (undone, failed, remainder) show again.
+      for (const [id, st] of [...acting]) {
+        if (st.acked || !f.queue.some(c => c.id === id && c.status === 'open')) acting.delete(id)
+      }
+      // Once the undo window closes, show what Telegram actually did for this attempt.
       for (const c of f.recent) {
-        if (awaiting.has(c.id) && c.resolution) {
-          awaiting.delete(c.id)
+        if (c.attempt && awaiting.has(c.attempt) && c.resolution) {
+          awaiting.delete(c.attempt)
           flash(c.resolution.summary, 3500)
         }
       }
-      for (const c of f.queue) {
-        if (awaiting.has(c.id) && c.status === 'open' && c.error) {
-          awaiting.delete(c.id)
-          acting.delete(c.id)
+      for (const [attempt, id] of [...awaiting]) {
+        const c = f.queue.find(x => x.id === id)
+        const stillPending = c?.status === 'pending' && c.pending?.attempt === attempt
+        if (c && !stillPending && c.status === 'open' && c.error && !f.recent.some(r => r.attempt === attempt)) {
+          awaiting.delete(attempt)
           flash(`Failed: ${c.error}`, 4000)
         }
       }

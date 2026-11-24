@@ -20,7 +20,8 @@ export interface Card {
   autoMuted: boolean
   status: 'open' | 'pending' | 'resolved' | 'dismissed'
   actions: { id: ActionId; label: string }[]
-  pending?: { action: ActionId; label: string; until: number }
+  pending?: { action: ActionId; label: string; until: number; attempt: string }
+  attempt?: string
   resolution?: { action: ActionId; summary: string; at: number }
   error?: string
   ai?: string
@@ -105,11 +106,11 @@ export class Api {
   }
 
   act(id: string, action: ActionId) {
-    return this.request<{ ok: boolean; error?: string; card?: Card }>('POST', '/act', { id, action })
+    return this.request<{ ok: boolean; error?: string; card?: Card; attempt?: string }>('POST', '/act', { id, action })
   }
 
   undo(id?: string) {
-    return this.request<{ ok: boolean; error?: string; id?: string }>('POST', '/undo', id ? { id } : {})
+    return this.request<{ ok: boolean; error?: string; id?: string; attempt?: string }>('POST', '/undo', id ? { id } : {})
   }
 
   setAutoMute(on: boolean) {
