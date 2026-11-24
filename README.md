@@ -1,83 +1,128 @@
-# G2 Feature Demo
+# Warden: guard your Telegram groups without reading them
 
-A demo app for Even Realities G2 glasses that exercises every Even Hub SDK (0.0.16) feature on one screen each, plus a **hardware emulator** that adds what the desktop simulator cannot do: IMU, ring / left-temple input, device status, location, and camera / album.
+Warden is an Even Realities G2 app for people who run Telegram communities. A bot sits in your groups as an admin. When a scam account shows up, your glasses show one verdict card, never the message itself. You pick an action with the ring and tap once.
 
-Built for the [Heads Up: Even Realities Hackathon](https://dorahacks.io/hackathon/even-realities/detail). Started on 2026-11-23 from the official Even Hub `minimal` template (Vite + TypeScript + SDK + CLI + simulator).
+```
+■■■■ SCAM   1/2                        auto-muted
+┌──────────────────────────────────────────────┐
+│ Wallet-drainer link                          │
+│ @ton_rewards_drop · 3 groups · 3 msgs        │
+│ Airdrop / claim bait · Joined 1m ago         │
+└──────────────────────────────────────────────┘
+ ▶ Ban + purge (3 groups)          ← tap
+   Ban + purge + warn group
+   Mute 24h
+   Not spam - trust
+```
 
-## Run
+**Track:** 01 Messaging & News (Telegram). Also entered for Best Telegram integration.
+
+## The problem
+
+Every crypto and Web3 project runs on Telegram groups, and every launch, AMA and airdrop brings a wave of attacks:
+
+- drainer bots that post fake "claim your airdrop" links,
+- accounts that copy an admin's name and photo and DM members to offer "support",
+- raids where dozens of accounts join in a minute.
+
+Admins catch these by reading every message on their phone, often while they host the AMA or speak on stage. A scam link that stays up for five minutes can empty members' wallets.
+
+## Who it is for
+
+Community managers and moderators of busy Telegram groups, crypto projects first. They already pay for anti-spam bots (Combot, Rose, Shieldy), but those bots either over-block or leave the judgment calls to a human staring at a phone.
+
+## How it works
+
+1. **The bot watches.** Add `@<your bot>` to your groups as an admin. It reads new messages, joins and join requests.
+2. **Rules score every message.** Fast, explainable signals: drainer-style links, airdrop and claim bait, seed-phrase requests, "DM me" pitches, look-alike domains, accounts that clone an admin's name, floods, the same text across groups, join spikes, and risky join requests. When the rules are unsure, Claude reviews the message and returns a short verdict.
+3. **Related events become one card.** The same account or the same text across three groups is one incident, not three.
+4. **The worst cases are stopped at once.** High-confidence scams and impersonators are muted at once, which can be undone. A human makes the final call.
+5. **You decide in one tap.** The card shows the verdict and the evidence. Swipe through the actions and tap one. Warden mutes the account right away, waits 5 seconds so you can hold to undo, and then bans the account and deletes its messages in every affected group.
+6. **AI writes the follow-up.** "Ban + purge + warn group" posts a short warning that Claude drafts, for example: "Admins never DM first. There is no claim link."
+
+### Glasses controls
+
+| Gesture | Card | Idle | Recent |
+|---|---|---|---|
+| Swipe | choose an action | - | scroll |
+| Tap | run the action | open recent actions | back |
+| Hold | undo the last action (5 s window) | undo | undo |
+| Double tap | exit | exit | exit |
+| Context menu | undo, auto-mute on/off, recent, unpair | | |
+
+The phone page inside the Even app handles pairing, lists your groups and shows each incident in detail when you want to read it later.
+
+### Built for the G2 platform limits
+
+- **Foreground only.** Warden is a "moderation shift" you open while hosting or working. While it is closed, the bot keeps scoring messages and auto-muting the worst cases, so a full queue waits for you when you come back.
+- **Design for a glance.** One card, three lines, at most four actions. The first action is always the safest sensible default.
+- **Keys stay on the backend.** The app holds only a session token. You pair it by sending `/pair 123456` to the bot, or by tapping "Open Telegram" on the phone page. Google sign-in is not needed.
+
+## Privacy and safety
+
+- The glasses never show message text, only Warden's verdict. Message text stays on the backend in memory and is shown only on the admin's phone.
+- Actions run only in groups where the paired Telegram account is an admin, and the server checks this on every action.
+- Each destructive action starts with a mute that can be undone and gives a 5-second undo window. "Not spam - trust" lifts the auto-mute and whitelists the user in that group.
+- The classifier treats message text as untrusted data, so injected instructions are only evidence. It is told to be conservative about normal crypto conversation.
+- No funds and no trading are involved.
+
+## Architecture
+
+```
+Telegram  ──getUpdates──►  server/ (Node 26, TypeScript)  ◄──HTTPS long poll──  src/ (G2 app in the Even app WebView)
+   ▲                         detect.ts   rules + scoring                          app.ts    cards, gestures
+   └──── Bot API actions ─── classify.ts Claude review + warning drafts           api.ts    session token, feed, actions
+                             engine.ts   incidents, auto-mute, act/undo/commit    phone.ts  phone page
+                             index.ts    HTTP API + bot loop
+```
+
+## Run it
+
+Requirements: Node 26+, the Even Hub simulator (installed as a dev dependency).
 
 ```bash
 npm install
-npm run dev        # dev server on :5173 (also serves the emulator panel)
-npm run simulate   # simulator with the automation API on :9898
 ```
 
-Then open the emulator panel at **http://localhost:5173/__emu**.
+### With the Telegram mock (no bot needed)
 
-On real glasses: `npx evenhub qr --url http://<your-ip>:5173`, then scan with the Even app. The emulator stays off there, so the real sensors are used.
-
-## Controls (glasses)
-
-| Gesture | Action |
-|---|---|
-| Swipe up / down | Move through the menu, or the screen's secondary action |
-| Tap | Open the item, or the screen's main action |
-| Long press (1.2 s or longer) | Back to the menu |
-| Double tap | Exit dialog, on every screen |
-| Context menu | "Back to menu" plus actions for the current screen |
-
-## Screens
-
-| # | Screen | What it shows |
-|---|---|---|
-| 1 | Input | Tap, double tap, swipes and long press, counted per source (right temple / left temple / ring) |
-| 2 | Text | Borders, corner radius and padding; text brightness 0–4; 5 Hz in-place updates; Japanese and symbols; long text |
-| 3 | List | Firmware-scrolled list (20 items) and selection events |
-| 4 | Image | Four canvas-drawn images (clock, 16 grey levels, text, shapes) and send times |
-| 5 | Microphone | Glasses or phone mic, level meter, peak, direction, speaker role (self / other) |
-| 6 | Motion | IMU on/off, report interval, sparklines per axis, dominant axis |
-| 7 | Location | One-shot fix, continuous updates, distance walked |
-| 8 | Camera / photos | Phone camera or album, then downscaled to 16 grey levels and shown on the glasses |
-| 9 | Device | Model, battery, wearing, charging, in-case, user info, launch source |
-| 10 | Storage | Counter saved in the app's own storage, which survives restarts |
-
-## Hardware emulator (development only)
-
-The simulator rejects `imuControl`, the location APIs, `pickImageFromAlbum` and `captureImageFromCamera`. It only emits right-temple input and never sends status changes.
-
-`src/dev/emulator.ts` wraps those bridge calls and injects real-format host events through `window._listenEvenAppMessage`, the entry point the SDK listens on, so the app code cannot tell them apart from real ones. `tools/emulator/` is a Vite plugin that serves the control panel and relays its commands over Vite's WebSocket.
-
-- Right-temple gestures, and list scrolling and selection, go to the simulator's own automation API, because the firmware scrolls lists itself.
-- Left-temple and ring gestures, long presses, menu clicks, IMU, status, location, lifecycle and photos are injected into the page.
-- Scriptable: `curl -X POST localhost:5173/__emu/send -d '{"type":"input","source":"ring","gesture":"tap"}'`
-- The emulator is active only inside the simulator (`?emu=1` / `?emu=0` to force). It is dev-server only and is not in `npm run build` or the `.ehpk`.
-- **Assumption:** IMU units and axes are undocumented. Emulated values are head angles in degrees (x = nod, y = shake, z = tilt). Re-tune on hardware.
-- External clients connect to the hub at `ws://<host>:5173/__emu/ws`: JSON commands in (same as `/__emu/send`, an optional `id` is echoed in an `ack`), `hello` / `state` JSON and changed glasses frames (binary PNG) out. IMU `mode: "external"` with `sample: {x, y, z}` streams a client's head pose; `location` with `live: true` moves the GPS fix without an immediate push.
-
-## Unreal simulator (G2Sim)
-
-`unreal/G2Sim` is a UE 5.8 desktop simulator: walk a 3D city in first person with the live glasses display over your view. Mouse look becomes IMU, walking becomes GPS, mouse and keys become temple / ring / context-menu input. Teammates without Unreal run the packaged `G2Sim.exe` alongside `npm run dev` and `npm run simulate`. See [unreal/G2Sim/README.md](unreal/G2Sim/README.md).
-
-## Known simulator differences
-
-- Double tap → `shutDownPageContainer(1)` closes the app immediately (no confirmation dialog). Restart the simulator.
-- Opening or closing the context menu emits foreground enter / exit events.
-- A Vite full reload makes `createStartUpPageContainer` return `1`. The app falls back to `rebuildPageContainer`.
-
-## Layout
-
+```bash
+npm run tgmock        # mock Bot API + live group viewer on http://localhost:8081
+npm run server:mock   # Warden backend on :8787 against the mock
+npm run dev           # glasses app on :5173 (proxies /api to :8787)
+npm run simulate      # Even Hub simulator
 ```
-src/main.ts            boot: early listeners, emulator (dev), app
-src/app.ts             router, global gestures, lifecycle
-src/core/              bridge queue + page model, input parsing, UI/glyph helpers, canvas → PNG
-src/screens/           one file per feature screen
-src/dev/emulator.ts    in-page emulator (dev only)
-tools/emulator/        Vite plugin + control panel + WebSocket hub
-unreal/G2Sim/          Unreal Engine 5.8 desktop simulator
-```
+
+Open http://localhost:8081. Copy the pairing code from the glasses into the "DM bot as admin" box, then press the scenario buttons: drainer bot, fake admin, raid, join requests.
+
+### With a real bot
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
+2. Create `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   ANTHROPIC_API_KEY=sk-ant-...      # optional; without it Warden runs on rules only
+   ```
+3. `npm run server`, then `npm run dev` and `npm run simulate`.
+4. Add the bot to a group as an admin with "Delete messages" and "Ban users". You must be an admin of that group too.
+5. Send the pairing code shown on the glasses to the bot.
+
+Environment variables for the backend: `PORT` (8787), `TELEGRAM_API_BASE`, `WARDEN_DATA` (data/warden.json), `WARDEN_MODEL` (claude-opus-5-5), `CORS_ORIGINS` (*). For the app: `VITE_WARDEN_API` (the backend URL in production builds).
+
+## Development tools in this repo
+
+- `tools/tgmock/`: a mock Telegram Bot API with scripted attacks and a live viewer.
+- `src/dev/emulator.ts` + `tools/emulator/`: hardware emulator for the desktop simulator (ring, left temple, long press, context menu, IMU, location), with a control panel at `/__emu` and a WebSocket hub at `/__emu/ws`. Scriptable: `curl -X POST localhost:5173/__emu/send -d '{"type":"input","source":"ring","gesture":"tap"}'`.
+- `unreal/G2Sim/`: an Unreal Engine 5.8 desktop and Quest simulator that shows the live glasses display over a 3D first-person view. See [unreal/G2Sim/README.md](unreal/G2Sim/README.md).
+
+Known simulator differences: a double tap closes the app at once with no confirmation. Opening the context menu emits foreground enter and exit events. A Vite full reload makes `createStartUpPageContainer` return `1`, and the app falls back to `rebuildPageContainer`.
+
+## What existed before the hackathon (Nov 23)
+
+Only the official Even Hub minimal starter (commit `843ac2b`). Everything else was built during the build week: the emulator, the G2Sim simulator, the Telegram mock and Warden itself.
 
 ## Pack
 
 ```bash
-npm run pack   # build + evenhub pack (--sdk-ver 0.0.16) → out.ehpk
+npm run pack   # build + evenhub pack → .ehpk
 ```

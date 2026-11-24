@@ -105,8 +105,8 @@ export async function startApp(bridge: EvenAppBridge) {
 
   function header(): ContainerSpec[] {
     return [
-      { kind: 'text', ...HDR, x: 0, y: 0, w: 456, h: 32, content: headerText(), brightness: 4, padding: 4 },
-      { kind: 'text', ...CLK, x: 456, y: 0, w: W - 456, h: 32, content: cornerText(), brightness: 2, padding: 4 },
+      { kind: 'text', ...HDR, x: 0, y: 0, w: 456, h: 32, content: headerText(), brightness: 4, padding: 0 },
+      { kind: 'text', ...CLK, x: 456, y: 0, w: W - 456, h: 32, content: cornerText(), brightness: 2, padding: 0 },
     ]
   }
 
@@ -176,22 +176,22 @@ export async function startApp(bridge: EvenAppBridge) {
       sig = `recent:${items.join('|')}`
       containers = [
         ...header(),
-        { kind: 'list', ...ACTIONS, x: 0, y: 36, w: W, h: H - 36 - 30, items: items.slice(0, 20), capture: true, selectBorder: true, padding: 2 },
-        { kind: 'text', ...FTR, x: 0, y: H - 30, w: W, h: 30, content: 'Tap: back', brightness: 2, padding: 4 },
+        { kind: 'list', ...ACTIONS, x: 0, y: 36, w: W, h: Math.min(items.length * 40 + 4, H - 36 - 30), items: items.slice(0, 20), capture: true, selectBorder: true, padding: 0 },
+        { kind: 'text', ...FTR, x: 0, y: H - 30, w: W, h: 30, content: 'Tap: back', brightness: 2, padding: 0 },
       ]
     } else if (next === 'pair') {
       sig = `pair:${f?.code}:${f?.bot}`
       containers = [
         ...header(),
         { kind: 'text', ...BODY, x: 0, y: 36, w: W, h: 216, content: pairBody(f, f?.code ?? '······'), border: 1, borderColor: 8, radius: 6, padding: 12, capture: true },
-        { kind: 'text', ...FTR, x: 0, y: H - 34, w: W, h: 34, content: 'Waiting for Telegram…', brightness: 2, padding: 4 },
+        { kind: 'text', ...FTR, x: 0, y: H - 34, w: W, h: 34, content: 'Waiting for Telegram…', brightness: 2, padding: 0 },
       ]
     } else if (next === 'idle' && f) {
       sig = 'idle'
       containers = [
         ...header(),
         { kind: 'text', ...BODY, x: 0, y: 36, w: W, h: 216, content: idleBody(f), border: 1, borderColor: 5, radius: 6, padding: 8, capture: true },
-        { kind: 'text', ...FTR, x: 0, y: H - 34, w: W, h: 34, content: 'Tap: recent  ·  Hold: undo  ·  Double: exit', brightness: 2, padding: 4 },
+        { kind: 'text', ...FTR, x: 0, y: H - 34, w: W, h: 34, content: 'Tap: recent  ·  Hold: undo  ·  Double: exit', brightness: 2, padding: 0 },
       ]
     } else {
       sig = 'boot'
