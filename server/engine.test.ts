@@ -6,9 +6,10 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join as pathJoin } from 'node:path'
 import { test } from 'node:test'
+import type { Verdict } from './classify.ts'
 import { analyzeMessage } from './detect.ts'
 import { Engine } from './engine.ts'
-import { ALL_ALLOWED, type Telegram, type TgChatMember, type TgMessage, type TgUpdate, type TgUser } from './telegram.ts'
+import { type Telegram, type TgChatMember, type TgMessage, type TgUpdate, type TgUser } from './telegram.ts'
 
 const BOT: TgUser = { id: 9000, is_bot: true, first_name: 'Warden', username: 'warden_bot' }
 const ALICE: TgUser = { id: 1, is_bot: false, first_name: 'Alice', username: 'alice_admin' }
@@ -16,7 +17,12 @@ const BOB: TgUser = { id: 2, is_bot: false, first_name: 'Bob', username: 'bob_ad
 const A = -100
 const B = -200
 const RULES_ONLY_THRESHOLD = 5 // keep in sync with engine.ts
-const PERMISSION_KEYS = Object.keys(ALL_ALLOWED).sort()
+// Every ChatPermissions field in the Bot API, written out independently of ALL_ALLOWED.
+const PERMISSION_KEYS = [
+  'can_send_messages', 'can_send_audios', 'can_send_documents', 'can_send_photos', 'can_send_videos',
+  'can_send_video_notes', 'can_send_voice_notes', 'can_send_polls', 'can_send_other_messages',
+  'can_add_web_page_previews', 'can_change_info', 'can_invite_users', 'can_pin_messages', 'can_manage_topics',
+].sort()
 
 interface Call {
   method: string
@@ -45,8 +51,9 @@ class FakeTelegram {
   async getMe() {
     return BOT
   }
+  chatPerms = new Map<number, Record<string, boolean>>()
   async getChat(chat: number) {
-    return { id: chat, type: 'supergroup', title: `G${chat}`, permissions: { can_send_messages: true } }
+    return { id: chat, type: 'supergroup', title: `G${chat}`, permissions: this.chatPerms.get(chat) ?? { can_send_messages: true } }
   }
   async getChatAdministrators(chat: number) {
     return this.admins.get(chat) ?? []
@@ -80,6 +87,7 @@ class FakeTelegram {
   }
   async setChatPermissions(chat: number, perms: Record<string, boolean>) {
     this.calls.push({ method: 'setPerms', chat, perms })
+    this.chatPerms.set(chat, perms)
     if (this.failSetPermsAfterApply) throw new Error('timeout (applied)')
     return true
   }
@@ -101,13 +109,13 @@ const tick = (ms = 10) => new Promise(r => setTimeout(r, ms))
 let nextMsg = 1
 let nextUpdate = 1
 
-async function setup(opts: { admins?: Record<number, TgChatMember[]> } = {}) {
+async function setup(opts: { admins?: Record<number, TgChatMember[]>; review?: () => Promise<Verdict | null> } = {}) {
   const tg = new FakeTelegram()
   tg.admins.set(A, opts.admins?.[A] ?? [adminMember(ALICE), adminMember(BOT)])
   tg.admins.set(B, opts.admins?.[B] ?? [adminMember(BOB), adminMember(BOT)])
   const dir = mkdtempSync(pathJoin(tmpdir(), 'warden-'))
   const file = pathJoin(dir, 'state.json')
-  const engine = new Engine(tg as unknown as Telegram, file, { undoMs: 50 })
+  const engine = new Engine(tg as unknown as Telegram, file, { undoMs: 50, liftRetryMs: 30, review: opts.review ?? (async () => null) })
   engine.bot = BOT
   const send = async (u: Omit<TgUpdate, 'update_id'>) => {
     await engine.handleUpdate({ update_id: nextUpdate++, ...u } as TgUpdate)
@@ -455,4 +463,93 @@ test('a warning in one sentence does not hide a seed-phrase request in another',
     { admins: [], recentCount10s: 1, sameTextGroups: 0, sameTextUsers: 0 },
   )
   assert.ok(a.signals.some(s => s.code === 'seed'))
+})
+
+// ---------------------------------------------------------------- round 3
+
+test('an old unmute retry never lifts a newer mute', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  t.engine.setAutoMute(alice, false)
+  const x = user(80, 'Spammy', 'spammy4')
+  await t.join(A, x)
+  await t.say(A, x, SPAM)
+  let card = t.engine.feed(alice)!.queue[0]
+  await t.engine.act(alice, card.id, 'mute')
+  await tick(5) // the mute lands
+  t.tg.failRestrict = true
+  const undone = await t.engine.undo(alice, card.id) // lift fails, a retry is scheduled
+  assert.ok(undone.error)
+  t.tg.failRestrict = false
+  t.tg.members.set(`${A}:80`, 'member') // e.g. lifted by hand meanwhile
+  card = t.engine.feed(alice)!.queue[0]
+  await t.engine.act(alice, card.id, 'mute') // a newer decision
+  await tick(200) // well past the retry
+  assert.equal(t.tg.members.get(`${A}:80`), 'restricted', 'the newer mute stands')
+})
+
+test('retrying a lock keeps the original permissions for the unlock', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  t.tg.chatPerms.set(A, { can_send_messages: true, can_send_photos: false })
+  for (let i = 0; i < 8; i++) await t.join(A, user(240 + i, `Bot${i}`, `bot3_${i}`))
+  const raid = t.engine.feed(alice)!.queue.find(c => c.kind === 'raid')!
+  t.tg.failSetPermsAfterApply = true
+  await t.engine.act(alice, raid.id, 'lock')
+  await tick(150)
+  t.tg.failSetPermsAfterApply = false
+  const again = t.engine.feed(alice)!.queue.find(c => c.kind === 'raid')!
+  assert.equal(again.status, 'open', 'the failed lock can be retried')
+  await t.engine.act(alice, again.id, 'lock')
+  await tick(150)
+  const realNow = Date.now
+  Date.now = () => realNow() + 11 * 60_000
+  try {
+    const tg2 = new FakeTelegram()
+    new Engine(tg2 as unknown as Telegram, t.file, { undoMs: 50 })
+    await tick(50)
+    const unlock = tg2.calls.find(c => c.method === 'setPerms')!
+    assert.deepEqual(unlock.perms, { can_send_messages: true, can_send_photos: false })
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test('a reversed "looks OK" verdict does not leak another group into the title', async () => {
+  const ok: Verdict = { category: 'ok', confidence: 'high', label: 'Project update link', reason: 'official' }
+  let calls = 0
+  const t = await setup({
+    admins: { [A]: [adminMember(ALICE), adminMember(BOT)], [B]: [adminMember(BOB), adminMember(BOT)] },
+    review: async () => (calls++ === 0 ? ok : null),
+  })
+  const alice = await t.pairAs(ALICE)
+  const x = user(81, 'Drop', 'drop_ok')
+  const clone = user(82, 'Bob', 'bob_admln')
+  await t.join(A, x)
+  await t.say(A, x, DRAINER)
+  await tick(50)
+  let card = t.engine.feed(alice)!.queue[0]
+  assert.ok(card.title.startsWith('Likely OK'), card.title)
+  // The clone was already in Bob's private group before Warden was added (no join event).
+  await t.say(B, clone, DRAINER) // same evidence, plus an impersonation signal
+  card = t.engine.feed(alice)!.queue[0]
+  assert.ok(!card.title.startsWith('Likely OK'), 'verdict reversed')
+  assert.equal(card.ai, undefined, 'stale ok verdict cleared')
+  assert.ok(![card.title, ...card.signals].some(s => /bob/i.test(s)), JSON.stringify(card))
+})
+
+test('a slow auto-mute that fails is not counted by a manual mute', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  t.tg.restrictDelayMs = 40
+  t.tg.failRestrict = true
+  const x = user(83, 'Drop', 'drop_slow')
+  await t.join(A, x)
+  await t.say(A, x, DRAINER) // auto-mute in flight
+  const card = t.engine.feed(alice)!.queue[0]
+  await t.engine.act(alice, card.id, 'mute')
+  await tick(250)
+  const after = t.engine.feed(alice)!
+  assert.equal(after.recent.length, 0)
+  assert.equal(after.queue[0]?.status, 'open')
 })

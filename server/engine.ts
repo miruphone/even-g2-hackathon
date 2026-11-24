@@ -15,7 +15,7 @@
 import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { draftWarning, review, type Verdict } from './classify.ts'
+import { draftWarning, review as claudeReview, type ReviewInput, type Verdict } from './classify.ts'
 import {
   adminHandle,
   analyzeJoin,
@@ -54,7 +54,8 @@ const MUTE_SECONDS = 24 * 3600
 const PAIR_CODE_MS = 10 * 60_000
 const RULES_ONLY_THRESHOLD = 5 // without Claude, gray-zone messages need this score to become a card
 const OVERRIDE_SCORE = 10 // a single message this strong is never demoted by an "ok" verdict
-const LIFT_RETRIES = 6
+const LIFT_RETRY_MS = 30_000
+const LIFT_RETRY_MAX_MS = 10 * 60_000
 
 // ---------------------------------------------------------------------------
 // Types shared with the glasses app (keep in sync with src/api.ts)
@@ -199,6 +200,8 @@ interface Persisted {
   groups: Group[]
   sessions: Session[]
   trusted: string[]
+  owned?: [string, number][] // mutes Warden applied: `${chat}:${user}` -> generation
+  lifts?: [string, number][] // lifts still to do (retried until done or superseded)
 }
 
 const ACTION_LABEL: Record<ActionId, string> = {
@@ -277,11 +280,21 @@ export class Engine {
   private waiters = new Set<() => void>()
   private saveTimer?: NodeJS.Timeout
   private statsTimer?: NodeJS.Timeout
+  // Ownership of mutes: each mute Warden applies gets a new generation. A lift
+  // (or its retry) only runs while its generation is still the current one, so
+  // an old retry can never undo a newer moderation decision.
+  private owned = new Map<string, number>()
+  private lifts = new Map<string, number>()
+  private generation = 0
+  private readonly review: (input: ReviewInput, cacheKey?: string) => Promise<Verdict | null>
+  private readonly liftRetryMs: number
 
-  constructor(tg: Telegram, dataFile: string, opts: { undoMs?: number } = {}) {
+  constructor(tg: Telegram, dataFile: string, opts: { undoMs?: number; liftRetryMs?: number; review?: (input: ReviewInput, cacheKey?: string) => Promise<Verdict | null> } = {}) {
     this.tg = tg
     this.dataFile = dataFile
     this.undoMs = opts.undoMs ?? UNDO_MS
+    this.review = opts.review ?? claudeReview
+    this.liftRetryMs = opts.liftRetryMs ?? LIFT_RETRY_MS
     this.load()
   }
 
@@ -293,11 +306,19 @@ export class Engine {
       for (const g of raw.groups ?? []) this.groups.set(g.id, { ...g, admins: (g.admins ?? []).filter(a => 'restrict' in a) })
       for (const s of raw.sessions ?? []) this.sessions.set(s.token, s)
       for (const t of raw.trusted ?? []) this.trusted.add(t)
+      for (const [k, g] of raw.owned ?? []) this.owned.set(k, g)
+      for (const [k, g] of raw.lifts ?? []) this.lifts.set(k, g)
+      this.generation = Math.max(0, ...this.owned.values(), ...this.lifts.values())
     } catch {
       // first run
     }
     // A lock outlives restarts: restore the saved permissions when it expires.
     for (const g of this.groups.values()) if (g.lock) this.scheduleUnlock(g)
+    // Lifts that were still failing when we stopped.
+    for (const [k, gen] of this.lifts) {
+      const [chatId, userId] = k.split(':').map(Number)
+      setTimeout(() => void this.liftMute(chatId, userId, gen), 1000).unref()
+    }
   }
 
   private save() {
@@ -308,7 +329,7 @@ export class Engine {
   /** Write state now. Returns false if it could not be persisted. */
   private saveNow(): boolean {
     clearTimeout(this.saveTimer)
-    const data: Persisted = { groups: [...this.groups.values()], sessions: [...this.sessions.values()], trusted: [...this.trusted] }
+    const data: Persisted = { groups: [...this.groups.values()], sessions: [...this.sessions.values()], trusted: [...this.trusted], owned: [...this.owned], lifts: [...this.lifts] }
     try {
       mkdirSync(dirname(this.dataFile), { recursive: true })
       writeFileSync(this.dataFile, JSON.stringify(data, null, 1))
@@ -509,6 +530,10 @@ export class Engine {
       if (m.status === 'kicked' || m.status === 'restricted') return 'already' as const
       try {
         await this.tg.restrictChatMember(chatId, userId, MUTED, Math.floor(Date.now() / 1000) + MUTE_SECONDS)
+        const k = key(chatId, userId)
+        this.owned.set(k, ++this.generation)
+        this.lifts.delete(k) // a new mute supersedes any pending lift
+        this.save()
         return 'muted' as const
       } catch (e) {
         console.warn('[engine] mute failed', errText(e))
@@ -517,15 +542,31 @@ export class Engine {
     })
   }
 
-  /** Lift a mute Warden applied. On failure, keeps retrying in the background and returns false. */
-  private liftMute(chatId: number, userId: number, attempt = 0): Promise<boolean> {
-    return this.onMember(key(chatId, userId), async () => {
+  /**
+   * Lift the mute Warden applied (generation `gen`, default: the current one).
+   * Returns true when lifted, or when there is nothing of ours left to lift.
+   * On failure it keeps retrying in the background, persisted across restarts,
+   * until it succeeds or a newer mute supersedes it.
+   */
+  private liftMute(chatId: number, userId: number, gen?: number, delay = this.liftRetryMs): Promise<boolean> {
+    const k = key(chatId, userId)
+    const target = gen ?? this.owned.get(k)
+    return this.onMember(k, async () => {
+      if (target === undefined || this.owned.get(k) !== target) {
+        if (this.lifts.get(k) === target) this.lifts.delete(k)
+        return true // not ours, or superseded by a newer decision
+      }
       try {
         await this.tg.restrictChatMember(chatId, userId, ALL_ALLOWED)
+        this.owned.delete(k)
+        this.lifts.delete(k)
+        this.save()
         return true
       } catch (e) {
-        console.warn(`[engine] unmute failed (try ${attempt + 1}):`, errText(e))
-        if (attempt + 1 < LIFT_RETRIES) setTimeout(() => void this.liftMute(chatId, userId, attempt + 1), 30_000).unref()
+        console.warn('[engine] unmute failed, will retry:', errText(e))
+        this.lifts.set(k, target)
+        this.save()
+        setTimeout(() => void this.liftMute(chatId, userId, target, Math.min(delay * 2, LIFT_RETRY_MAX_MS)), delay).unref()
         return false
       }
     })
@@ -550,12 +591,19 @@ export class Engine {
   // ---------------------------------------------------------------- group lock
 
   private async lockChat(g: Group): Promise<void> {
-    const chat = await this.tg.getChat(g.id)
-    // Persist the unlock plan before locking, so a restart can always unlock.
-    g.lock = { until: Date.now() + LOCK_MS, saved: chat.permissions }
-    if (!this.saveNow()) {
-      g.lock = undefined
-      throw new Error('could not save the unlock plan')
+    if (g.lock) {
+      // Retrying a lock (e.g. after a lost response): keep the original
+      // permissions, which a fresh getChat would now report as locked.
+      g.lock.until = Date.now() + LOCK_MS
+      if (!this.saveNow()) throw new Error('could not save the unlock plan')
+    } else {
+      const chat = await this.tg.getChat(g.id)
+      // Persist the unlock plan before locking, so a restart can always unlock.
+      g.lock = { until: Date.now() + LOCK_MS, saved: chat.permissions }
+      if (!this.saveNow()) {
+        g.lock = undefined
+        throw new Error('could not save the unlock plan')
+      }
     }
     // Even if the call fails ambiguously (applied, but the response was lost),
     // the unlock still runs: restoring the saved permissions is always safe.
@@ -729,7 +777,7 @@ export class Engine {
     const newcomer = joinedAt !== undefined && recent.length <= 3
     if (own >= THRESHOLD_REVIEW || (newcomer && a.urls.length > 0)) {
       const input = { groupTitle: g.title, senderName: displayName(user), senderUsername: user.username, minutesSinceJoin: joinedAt ? Math.round((now - joinedAt) / 60_000) : undefined, signals: a.signals.map(s => s.label), links: a.urls, text }
-      const v = await review(input, reviewKey(g.id, user, a))
+      const v = await this.review(input, reviewKey(g.id, user, a))
       if (v && v.category !== 'ok' && v.category !== 'promo' && v.confidence !== 'low') {
         const boost = v.confidence === 'high' ? 4 : 2
         const kind: Kind = v.category === 'impersonation' ? 'impersonation' : v.category === 'spam' || v.category === 'toxic' ? 'spam' : 'scam'
@@ -750,7 +798,7 @@ export class Engine {
   private async refine(inc: Incident, g: Group, user: TgUser, a: Analysis) {
     if (inc.evidence.get(g.id)?.verdict) return
     const joinedAt = this.joins.get(key(g.id, user.id))
-    const v = await review(
+    const v = await this.review(
       { groupTitle: g.title, senderName: displayName(user), senderUsername: user.username, minutesSinceJoin: joinedAt ? Math.round((Date.now() - joinedAt) / 60_000) : undefined, signals: a.signals.map(s => s.label), links: a.urls, text: a.text },
       reviewKey(g.id, user, a),
     )
@@ -822,7 +870,7 @@ export class Engine {
     inc.impersonated = p.impersonated ?? imp?.label.replace(/^Clone of /, '')
     inc.actors.set(p.actor.id, actorOf(p.actor))
     inc.pairs.set(p.chatId, new Map([[p.actor.id, [...p.messageIds]]]))
-    inc.evidence.set(p.chatId, { title: defaultTitle(inc.kind, a, inc.impersonated), signals: a.signals.map(s => s.label), sample: p.sample?.slice(0, 280) })
+    inc.evidence.set(p.chatId, { title: defaultTitle(inc.kind, a, p.impersonated), signals: a.signals.map(s => s.label), sample: p.sample?.slice(0, 280) })
     this.incidents.set(inc.id, inc)
     this.maybeAutoMute(inc, p.chatId, p.actor.id)
     this.bump()
@@ -836,16 +884,20 @@ export class Engine {
     if (messageId !== undefined && !ids.includes(messageId)) ids.push(messageId)
     users.set(user.id, ids)
     inc.pairs.set(chatId, users)
-    const ev = inc.evidence.get(chatId) ?? { title: defaultTitle(inc.kind, a, inc.impersonated), signals: [] }
+    const ev = inc.evidence.get(chatId) ?? { title: defaultTitle(inc.kind, a), signals: [] }
     for (const s of a.signals) if (!ev.signals.includes(s.label)) ev.signals.push(s.label)
     ev.sample ??= a.text ? a.text.slice(0, 280) : undefined
     inc.evidence.set(chatId, ev)
     inc.score = Math.max(inc.score, a.score) + 1
     inc.maxRuleScore = Math.max(inc.maxRuleScore, a.score)
-    // Strong new evidence overrides an earlier "looks OK" verdict.
-    if (inc.likelyOk && a.score >= THRESHOLD_INCIDENT) {
+    // Strong new evidence overrides an earlier "looks OK" verdict. Each chat's
+    // title is rebuilt from its own evidence only, never from this message's.
+    if (inc.likelyOk && (a.score >= THRESHOLD_INCIDENT || a.signals.some(x => STRONG_CODES.has(x.code)))) {
       inc.likelyOk = false
-      for (const e of inc.evidence.values()) if (e.title.startsWith('Likely OK')) e.title = defaultTitle(inc.kind, a, inc.impersonated)
+      for (const [c, e] of inc.evidence) {
+        if (e.verdict && (e.verdict.category === 'ok' || e.verdict.category === 'promo')) e.verdict = undefined
+        if (e.title.startsWith('Likely OK')) e.title = c === chatId ? defaultTitle(inc.kind, a) : titleFromSignals(inc.kind, e.signals)
+      }
     }
     if (!inc.likelyOk) inc.severity = severityOf(inc.score)
     inc.updatedAt = Date.now()
@@ -1152,7 +1204,8 @@ export class Engine {
       }
     } else if (action === 'mute') {
       for (const [chatId, users] of scope) {
-        const canDelete = this.allowed(chatId, p.by, 'delete')
+        // Removing their messages is a delete operation: check that right too, now.
+        const canDelete = await this.stillAllowed(chatId, p.by, 'delete')
         for (const [u, ids] of users) {
           const k = key(chatId, u)
           const state = p.immediate.has(k) || i.autoMuted.has(k) ? 'muted' : await this.muteMember(chatId, u)
@@ -1161,8 +1214,12 @@ export class Engine {
             continue
           }
           if (state === 'already') already++
+          if (ids.length && canDelete) {
+            const n = await this.deleteIds(chatId, ids, errors)
+            removed += n
+            if (n < new Set(ids).size) continue // muted, but messages remain: keep the pair open
+          }
           okPairs.add(k)
-          if (ids.length && canDelete) removed += await this.deleteIds(chatId, ids, errors)
         }
         if (!canDelete) notes.push('no delete right, messages kept')
       }
@@ -1303,10 +1360,23 @@ function reviewKey(chatId: number, user: TgUser, a: Analysis): string {
     .digest('hex')
 }
 
+/** Signals strong enough on their own to overturn a "looks OK" verdict. */
+const STRONG_CODES = new Set(['seed', 'lure', 'impersonation', 'punycode'])
+
+/** A chat's card title, from that chat's own evidence. */
 function defaultTitle(kind: Kind, a: Analysis, impersonated?: string): string {
-  if (kind === 'impersonation') return `Fake ${impersonated ?? 'admin'}`.slice(0, 28)
-  const top = a.signals.find(s => !REPETITION_CODES.has(s.code)) ?? a.signals[0]
+  const imp = impersonated ?? a.signals.find(s => s.code === 'impersonation')?.label.replace(/^Clone of /, '')
+  if (kind === 'impersonation') return `Fake ${imp ?? 'admin'}`.slice(0, 28)
+  return titleFromSignals(kind, a.signals.filter(s => !REPETITION_CODES.has(s.code)).map(s => s.label))
+}
+
+function titleFromSignals(kind: Kind, labels: string[]): string {
+  if (kind === 'impersonation') {
+    const clone = labels.find(l => l.startsWith('Clone of '))
+    return `Fake ${clone ? clone.replace(/^Clone of /, '') : 'admin'}`.slice(0, 28)
+  }
+  const top = labels[0]
   if (!top) return KIND_TITLE[kind]
-  if (kind === 'scam') return top.label
-  return `${KIND_TITLE[kind]}: ${top.label}`.slice(0, 28)
+  if (kind === 'scam') return top.slice(0, 28)
+  return `${KIND_TITLE[kind]}: ${top}`.slice(0, 28)
 }
