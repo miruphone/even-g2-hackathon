@@ -237,6 +237,20 @@ async function api(method: string, p: Record<string, unknown>): Promise<unknown>
       const c = chatOf(chatId)
       return { ...c.chat, permissions: c.permissions }
     }
+    case 'getChatMember': {
+      const c = chatOf(chatId)
+      const m = c.members.get(userId)
+      const user = m?.user ?? users.get(userId)
+      if (!user) throw new ApiError(400, 'Bad Request: user not found')
+      const status = m?.status ?? 'left'
+      const admin = status === 'creator' || status === 'administrator'
+      return {
+        status,
+        user,
+        ...(admin ? { can_delete_messages: true, can_restrict_members: true, can_invite_users: true, can_pin_messages: true } : {}),
+        ...(status === 'restricted' ? { can_send_messages: false, until_date: m?.until ?? 0 } : {}),
+      }
+    }
     case 'getChatAdministrators':
       return [...chatOf(chatId).members.values()]
         .filter(m => m.status === 'creator' || m.status === 'administrator')
@@ -286,7 +300,8 @@ async function api(method: string, p: Record<string, unknown>): Promise<unknown>
       const m = c.members.get(userId)
       if (!m) throw new ApiError(400, 'Bad Request: user not found')
       const perms = p.permissions as Record<string, boolean>
-      const muted = perms.can_send_messages === false
+      // Like Telegram: only all-true permissions lift a restriction.
+      const muted = Object.keys(OPEN).some(k => perms[k] !== true)
       c.members.set(userId, { user: m.user, status: muted ? 'restricted' : 'member', until: muted ? Number(p.until_date ?? 0) || undefined : undefined })
       note(`${muted ? 'muted' : 'unmuted'} ${m.user.first_name} in ${c.chat.title}`)
       return true

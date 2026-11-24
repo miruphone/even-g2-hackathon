@@ -139,7 +139,7 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && path === '/undo') {
       const body = await readJson(req)
-      const r = typeof body.id === 'string' ? engine.undo(token, body.id) : engine.undoLast(token)
+      const r = await engine.undo(token, typeof body.id === 'string' ? body.id : undefined)
       return send(res, r.ok ? 200 : 409, r)
     }
 

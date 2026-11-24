@@ -22,6 +22,7 @@ export interface Card {
   actions: { id: ActionId; label: string }[]
   pending?: { action: ActionId; label: string; until: number }
   resolution?: { action: ActionId; summary: string; at: number }
+  error?: string
   ai?: string
   createdAt: number
   sample?: string
@@ -40,6 +41,7 @@ export interface Feed {
   bot: string | null
   paired: boolean
   code?: string
+  codeExpires?: number
   autoMute: boolean
 }
 

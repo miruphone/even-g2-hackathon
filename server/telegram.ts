@@ -50,6 +50,8 @@ export interface TgChatMember {
   can_restrict_members?: boolean
   can_invite_users?: boolean
   can_pin_messages?: boolean
+  can_send_messages?: boolean // restricted members only
+  until_date?: number
 }
 
 export interface TgChatMemberUpdated {
@@ -103,6 +105,9 @@ export const MUTED: TgChatPermissions = {
   can_send_other_messages: false,
   can_add_web_page_previews: false,
 }
+
+/** All permissions true: Telegram lifts the member's individual restriction (group defaults apply again). */
+export const ALL_ALLOWED: TgChatPermissions = Object.fromEntries(Object.keys(MUTED).map(k => [k, true])) as TgChatPermissions
 
 export class TelegramError extends Error {
   readonly code: number
@@ -165,6 +170,10 @@ export class Telegram {
     return this.call<TgChat & { permissions?: TgChatPermissions }>('getChat', { chat_id: chatId })
   }
 
+  getChatMember(chatId: number, userId: number) {
+    return this.call<TgChatMember>('getChatMember', { chat_id: chatId, user_id: userId })
+  }
+
   getChatAdministrators(chatId: number) {
     return this.call<TgChatMember[]>('getChatAdministrators', { chat_id: chatId })
   }
@@ -173,8 +182,10 @@ export class Telegram {
     return this.call<TgMessage>('sendMessage', { chat_id: chatId, text, ...extra })
   }
 
+  /** Telegram accepts 1-100 ids per call; callers batch. */
   deleteMessages(chatId: number, messageIds: number[]) {
-    return this.call<boolean>('deleteMessages', { chat_id: chatId, message_ids: messageIds.slice(0, 100) })
+    if (messageIds.length < 1 || messageIds.length > 100) throw new RangeError('deleteMessages takes 1-100 ids')
+    return this.call<boolean>('deleteMessages', { chat_id: chatId, message_ids: messageIds })
   }
 
   banChatMember(chatId: number, userId: number, revokeMessages = true) {

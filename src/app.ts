@@ -150,7 +150,20 @@ export async function startApp(bridge: EvenAppBridge) {
     ].join('\n')
   }
 
-  async function render(force = false) {
+  // What is actually on the glasses. Input acts on this, never on a card that
+  // is still being sent over BLE.
+  let shownView: View = 'boot'
+  let shownCard: Card | null = null
+  let transitioning = false
+  let chain: Promise<void> = Promise.resolve()
+
+  /** Renders run one at a time, in order. */
+  function render(force = false): Promise<void> {
+    chain = chain.then(() => doRender(force)).catch(e => log(`render failed: ${String(e)}`))
+    return chain
+  }
+
+  async function doRender(force: boolean) {
     const f = feed
     let next: View
     if (!f) next = 'boot'
@@ -203,9 +216,23 @@ export async function startApp(bridge: EvenAppBridge) {
 
     view = next
     if (force || sig !== signature) {
-      signature = sig
-      await renderPage({ containers, menu: menu() })
+      transitioning = true
+      try {
+        const ok = await renderPage({ containers, menu: menu() })
+        // On failure, forget the signature so the next feed update retries.
+        signature = ok ? sig : ''
+        if (ok) {
+          shownView = next
+          shownCard = card
+        }
+      } catch (e) {
+        signature = ''
+        throw e
+      } finally {
+        transitioning = false
+      }
     } else {
+      if (shownCard && card && shownCard.id === card.id) shownCard = card
       updateHeader()
       if (next === 'idle' && f) setText(BODY.id, BODY.name, idleBody(f))
     }
@@ -233,6 +260,10 @@ export async function startApp(bridge: EvenAppBridge) {
     void render()
     try {
       const r = await api.act(c.id, a.id)
+      if (r.ok && a.id === 'later') {
+        acting.delete(c.id)
+        void render()
+      }
       if (!r.ok) {
         acting.delete(c.id)
         awaiting.delete(c.id)
@@ -296,11 +327,19 @@ export async function startApp(bridge: EvenAppBridge) {
       return
     }
     if (input.gesture !== 'tap') return
-    if (view === 'card' && card && input.via === 'list') void act(card, input.listIndex ?? 0)
-    else if (view === 'recent') {
+    if (transitioning) {
+      log('tap ignored: display is changing')
+      return
+    }
+    if (shownView === 'card' && input.via === 'list') {
+      // Act only on the card the wearer is looking at, and only if it is still open.
+      const c = shownCard && openCards().find(x => x.id === shownCard!.id)
+      if (c) void act(c, input.listIndex ?? 0)
+      else void render()
+    } else if (shownView === 'recent') {
       showRecent = false
       void render()
-    } else if (view === 'idle') {
+    } else if (shownView === 'idle') {
       showRecent = true
       void render()
     }
@@ -335,6 +374,13 @@ export async function startApp(bridge: EvenAppBridge) {
         if (awaiting.has(c.id) && c.resolution) {
           awaiting.delete(c.id)
           flash(c.resolution.summary, 3500)
+        }
+      }
+      for (const c of f.queue) {
+        if (awaiting.has(c.id) && c.status === 'open' && c.error) {
+          awaiting.delete(c.id)
+          acting.delete(c.id)
+          flash(`Failed: ${c.error}`, 4000)
         }
       }
       await render()

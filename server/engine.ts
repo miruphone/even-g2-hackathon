@@ -1,11 +1,22 @@
 // Warden engine: turns Telegram updates into incident cards, and card actions
 // into Bot API calls. One instance per bot.
+//
+// Safety model
+// - An incident records exactly which user did what in which chat (pairs).
+//   Actions touch only those pairs, never the cross product of chats and users.
+// - Every session sees and acts on a projection of an incident: only the chats
+//   where its Telegram user is an admin with the right that the action needs.
+// - An action freezes its scope when it starts and re-checks the admin's rights
+//   before it commits. Only the admin who started it can undo it.
+// - Mutes and unmutes of one member run strictly in order, and Warden only lifts
+//   mutes it applied itself.
 
-import { randomBytes, randomInt } from 'node:crypto'
+import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { draftWarning, review, type Verdict } from './classify.ts'
 import {
+  adminHandle,
   analyzeJoin,
   analyzeMessage,
   impersonates,
@@ -17,12 +28,14 @@ import {
   type Kind,
 } from './detect.ts'
 import {
+  ALL_ALLOWED,
   displayName,
   handle,
   MUTED,
   Telegram,
   TelegramError,
   type TgChatJoinRequest,
+  type TgChatMember,
   type TgChatMemberUpdated,
   type TgChatPermissions,
   type TgMessage,
@@ -36,6 +49,7 @@ const RAID_WINDOW_MS = 60_000
 const RAID_JOINS = 8
 const LOCK_MS = 10 * 60_000
 const MUTE_SECONDS = 24 * 3600
+const PAIR_CODE_MS = 10 * 60_000
 
 // ---------------------------------------------------------------------------
 // Types shared with the glasses app (keep in sync with src/api.ts)
@@ -63,7 +77,8 @@ export interface Card {
   actions: CardAction[]
   pending?: { action: ActionId; label: string; until: number }
   resolution?: { action: ActionId; summary: string; at: number }
-  ai?: string // verdict source, e.g. "Claude: high"
+  error?: string
+  ai?: string // verdict source, e.g. "Claude: scam (high)"
   createdAt: number
   // Phone-only detail (never sent to the glasses UI).
   sample?: string
@@ -79,23 +94,32 @@ export interface Feed {
   queue: Card[]
   recent: Card[]
   llm: string
+  codeExpires?: number
 }
 
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
 
+type Right = 'restrict' | 'delete' | 'invite' | 'any'
+
+interface AdminInfo extends AdminRef {
+  creator: boolean
+  restrict: boolean
+  delete: boolean
+  invite: boolean
+}
+
 interface Group {
   id: number
   title: string
   username?: string
   rights: { delete: boolean; restrict: boolean; invite: boolean; pin: boolean }
-  admins: AdminRef[]
+  admins: AdminInfo[]
   adminsAt: number
   active: boolean
   scanned: number
-  savedPermissions?: TgChatPermissions
-  lockedUntil?: number
+  lock?: { until: number; saved?: TgChatPermissions }
 }
 
 interface Session {
@@ -117,6 +141,20 @@ interface Actor {
   isBot: boolean
 }
 
+/** chat id -> user id -> message ids */
+type Pairs = Map<number, Map<number, number[]>>
+
+interface Pending {
+  action: ActionId
+  by: number // Telegram user id of the admin who acted
+  token: string
+  scope: Pairs
+  until: number
+  timer: NodeJS.Timeout
+  mutes: Promise<void>
+  immediate: Set<string> // `${chat}:${user}` muted by this action
+}
+
 interface Incident {
   id: string
   kind: Kind
@@ -124,22 +162,23 @@ interface Incident {
   severity: 1 | 2 | 3 | 4
   title: string
   signals: string[]
+  pairs: Pairs
   actors: Map<number, Actor>
-  chats: Map<number, number[]> // chatId -> message ids
+  samples: Map<number, string>
   fingerprint: string
   impersonated?: string
   joinRequest?: { chatId: number; userId: number }
   raidChat?: number
-  autoMuted: Set<string> // `${chatId}:${userId}`
-  immediateMuted: Set<string>
+  autoMuted: Set<string>
+  autoOps: Promise<void>[]
   status: Card['status']
   createdAt: number
   updatedAt: number
   verdict?: Verdict
-  sample?: string
+  likelyOk?: boolean
   warning?: string
-  pending?: { action: ActionId; by: number; until: number; timer: NodeJS.Timeout }
-  resolution?: { action: ActionId; summary: string; at: number }
+  pending?: Pending
+  lastError?: string
 }
 
 interface Persisted {
@@ -160,6 +199,18 @@ const ACTION_LABEL: Record<ActionId, string> = {
   later: 'Later',
 }
 
+const ACTION_RIGHT: Record<ActionId, Right> = {
+  ban: 'restrict',
+  ban_warn: 'restrict',
+  mute: 'restrict',
+  lock: 'restrict',
+  delete: 'delete',
+  approve: 'invite',
+  decline: 'invite',
+  dismiss: 'any',
+  later: 'any',
+}
+
 const KIND_TITLE: Record<Kind, string> = {
   scam: 'Scam',
   impersonation: 'Admin impersonator',
@@ -167,6 +218,18 @@ const KIND_TITLE: Record<Kind, string> = {
   flood: 'Flood',
   join: 'Join request',
   raid: 'Raid',
+}
+
+const key = (chatId: number, userId: number) => `${chatId}:${userId}`
+
+function countMessages(p: Pairs): number {
+  let n = 0
+  for (const users of p.values()) for (const ids of users.values()) n += ids.length
+  return n
+}
+
+function errText(e: unknown): string {
+  return e instanceof TelegramError ? e.message.replace(/^\w+: \d+ /, '') : e instanceof Error ? e.message : String(e)
 }
 
 export class Engine {
@@ -177,19 +240,23 @@ export class Engine {
   private sessions = new Map<string, Session>()
   private trusted = new Set<string>()
   private incidents = new Map<string, Incident>()
+  private history = new Map<number, Card[]>() // admin Telegram id -> what they did, newest first
   private joins = new Map<string, number>() // `${chat}:${user}` -> joinedAt
   private joinTimes = new Map<number, number[]>() // chat -> recent join timestamps
   private userMsgs = new Map<string, { id: number; at: number }[]>() // `${chat}:${user}` -> recent messages
   private fingerprints = new Map<string, { chatId: number; userId: number; at: number }[]>()
+  private memberOps = new Map<string, Promise<unknown>>()
   private rev = 1
   private waiters = new Set<() => void>()
   private saveTimer?: NodeJS.Timeout
   private statsTimer?: NodeJS.Timeout
-  autoMutedTotal = 0
 
-  constructor(tg: Telegram, dataFile: string) {
+  private readonly undoMs: number
+
+  constructor(tg: Telegram, dataFile: string, opts: { undoMs?: number } = {}) {
     this.tg = tg
     this.dataFile = dataFile
+    this.undoMs = opts.undoMs ?? UNDO_MS
     this.load()
   }
 
@@ -198,25 +265,30 @@ export class Engine {
   private load() {
     try {
       const raw = JSON.parse(readFileSync(this.dataFile, 'utf8')) as Persisted
-      for (const g of raw.groups ?? []) this.groups.set(g.id, { ...g, lockedUntil: undefined })
+      for (const g of raw.groups ?? []) this.groups.set(g.id, { ...g, admins: (g.admins ?? []).filter(a => 'restrict' in a) })
       for (const s of raw.sessions ?? []) this.sessions.set(s.token, s)
       for (const t of raw.trusted ?? []) this.trusted.add(t)
     } catch {
       // first run
     }
+    // A lock outlives restarts: restore the saved permissions when it expires.
+    for (const g of this.groups.values()) if (g.lock) this.scheduleUnlock(g)
   }
 
   private save() {
     clearTimeout(this.saveTimer)
-    this.saveTimer = setTimeout(() => {
-      const data: Persisted = { groups: [...this.groups.values()], sessions: [...this.sessions.values()], trusted: [...this.trusted] }
-      try {
-        mkdirSync(dirname(this.dataFile), { recursive: true })
-        writeFileSync(this.dataFile, JSON.stringify(data, null, 1))
-      } catch (e) {
-        console.warn('[engine] save failed', e)
-      }
-    }, 500)
+    this.saveTimer = setTimeout(() => this.saveNow(), 500)
+  }
+
+  private saveNow() {
+    clearTimeout(this.saveTimer)
+    const data: Persisted = { groups: [...this.groups.values()], sessions: [...this.sessions.values()], trusted: [...this.trusted] }
+    try {
+      mkdirSync(dirname(this.dataFile), { recursive: true })
+      writeFileSync(this.dataFile, JSON.stringify(data, null, 1))
+    } catch (e) {
+      console.warn('[engine] save failed', e)
+    }
   }
 
   private bump() {
@@ -242,15 +314,22 @@ export class Engine {
 
   // ---------------------------------------------------------------- sessions / pairing
 
-  startPairing(): { token: string; code: string; expires: number } {
-    const token = randomBytes(24).toString('base64url')
+  private newCode(): string {
     let code = ''
     do code = String(randomInt(100000, 1000000))
     while ([...this.sessions.values()].some(s => s.code === code && s.codeExpires > Date.now()))
-    const s: Session = { token, code, codeExpires: Date.now() + 10 * 60_000, createdAt: Date.now(), lastSeen: Date.now(), autoMute: true, handled: 0 }
+    return code
+  }
+
+  startPairing(): { token: string; code: string; expires: number } {
+    const now = Date.now()
+    // Unpaired sessions older than a day are abandoned setups.
+    for (const [t, s] of this.sessions) if (!s.userId && now - s.lastSeen > 24 * 3600_000) this.sessions.delete(t)
+    const token = randomBytes(24).toString('base64url')
+    const s: Session = { token, code: this.newCode(), codeExpires: now + PAIR_CODE_MS, createdAt: now, lastSeen: now, autoMute: true, handled: 0 }
     this.sessions.set(token, s)
     this.save()
-    return { token, code, expires: s.codeExpires }
+    return { token, code: s.code, expires: s.codeExpires }
   }
 
   session(token: string | undefined): Session | undefined {
@@ -274,7 +353,7 @@ export class Engine {
   }
 
   private async pair(code: string, from: TgUser): Promise<string> {
-    const s = [...this.sessions.values()].find(x => x.code === code && x.codeExpires > Date.now() && !x.userId)
+    const s = [...this.sessions.values()].find(x => !x.userId && x.code === code && x.codeExpires > Date.now())
     if (!s) return 'That code is unknown or expired. Open Warden on your glasses to get a new one.'
     s.userId = from.id
     s.userName = handle(from)
@@ -284,14 +363,14 @@ export class Engine {
     this.bump()
     const mine = this.groupsFor(s)
     if (mine.length === 0) {
-      return `Paired with your glasses ✅\n\nNo groups yet. Add me to a group as an admin with "Delete messages" and "Ban users" rights. You must be an admin there too.`
+      return 'Paired with your glasses ✅\n\nNo groups yet. Add me to a group as an admin with "Delete messages" and "Ban users" rights. You must be an admin there too.'
     }
     return `Paired with your glasses ✅\n\nWatching ${mine.length} group(s):\n${mine.map(g => `• ${g.title}${this.missingRights(g)}`).join('\n')}`
   }
 
   private missingRights(g: Group): string {
     const miss = [!g.rights.delete && 'delete', !g.rights.restrict && 'ban'].filter(Boolean)
-    return miss.length ? ` (missing rights: ${miss.join(', ')})` : ''
+    return miss.length ? ` (bot is missing rights: ${miss.join(', ')})` : ''
   }
 
   private groupsFor(s: Session): Group[] {
@@ -299,22 +378,44 @@ export class Engine {
     return [...this.groups.values()].filter(g => g.active && g.admins.some(a => a.id === s.userId))
   }
 
+  /** Does this Telegram user (and the bot) hold `right` in this chat, per the cached admin list? */
+  private allowed(chatId: number, userId: number, right: Right): boolean {
+    const g = this.groups.get(chatId)
+    const a = g?.admins.find(x => x.id === userId)
+    if (!g || !g.active || !a) return false
+    if (right === 'any') return true
+    return (a.creator || a[right]) && g.rights[right]
+  }
+
+  /** The part of an incident this admin may act on with this right. */
+  private scopeFor(i: Incident, userId: number, right: Right): Pairs {
+    const out: Pairs = new Map()
+    for (const [chatId, users] of i.pairs) {
+      if (!this.allowed(chatId, userId, right)) continue
+      const copy = new Map<number, number[]>()
+      for (const [u, ids] of users) copy.set(u, [...ids])
+      out.set(chatId, copy)
+    }
+    return out
+  }
+
   // ---------------------------------------------------------------- groups / admins
 
   private async refreshAdmins(g: Group) {
     try {
       const list = await this.tg.getChatAdministrators(g.id)
-      g.admins = list.filter(m => !m.user.is_bot).map(m => ({ id: m.user.id, first_name: m.user.first_name, last_name: m.user.last_name, username: m.user.username }))
+      g.admins = list.filter(m => !m.user.is_bot).map(adminInfo)
       const me = list.find(m => m.user.id === this.bot?.id)
+      const creator = me?.status === 'creator'
       g.rights = {
-        delete: !!me?.can_delete_messages || me?.status === 'creator',
-        restrict: !!me?.can_restrict_members || me?.status === 'creator',
-        invite: !!me?.can_invite_users || me?.status === 'creator',
-        pin: !!me?.can_pin_messages || me?.status === 'creator',
+        delete: creator || !!me?.can_delete_messages,
+        restrict: creator || !!me?.can_restrict_members,
+        invite: creator || !!me?.can_invite_users,
+        pin: creator || !!me?.can_pin_messages,
       }
       g.adminsAt = Date.now()
     } catch (e) {
-      console.warn(`[engine] admins of ${g.title} failed:`, (e as Error).message)
+      console.warn(`[engine] admins of ${g.title} failed:`, errText(e))
     }
   }
 
@@ -328,18 +429,120 @@ export class Engine {
     if (!g) {
       g = { id: chat.id, title: chat.title ?? String(chat.id), username: chat.username, rights: { delete: false, restrict: false, invite: false, pin: false }, admins: [], adminsAt: 0, active: true, scanned: 0 }
       this.groups.set(chat.id, g)
-      void this.refreshAdmins(g).then(() => {
+      const created = g
+      void this.refreshAdmins(created).then(() => {
         this.save()
         this.bump()
       })
     } else if (chat.title && g.title !== chat.title) {
       g.title = chat.title
     }
-    if (Date.now() - g.adminsAt > 10 * 60_000 && g.adminsAt !== 0) {
-      g.adminsAt = Date.now() // avoid a refresh storm; the call below updates it again
+    if (g.adminsAt !== 0 && Date.now() - g.adminsAt > 10 * 60_000) {
+      g.adminsAt = Date.now() // avoid a refresh storm; refreshAdmins sets it again
       void this.refreshAdmins(g)
     }
     return g
+  }
+
+  // ---------------------------------------------------------------- member mutations (serialized per member)
+
+  private onMember<T>(k: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.memberOps.get(k) ?? Promise.resolve()
+    const next = prev.then(fn, fn)
+    const tail = next.catch(() => undefined)
+    this.memberOps.set(k, tail)
+    void tail.then(() => {
+      if (this.memberOps.get(k) === tail) this.memberOps.delete(k)
+    })
+    return next
+  }
+
+  /**
+   * Mute for 24 h. Returns 'muted' only when Warden applied the mute itself;
+   * members someone else already restricted are left alone ('already') so
+   * Warden never lifts a restriction it did not set.
+   */
+  private muteMember(chatId: number, userId: number): Promise<'muted' | 'already' | 'failed'> {
+    return this.onMember(key(chatId, userId), async () => {
+      let m: TgChatMember | null = null
+      try {
+        m = await this.tg.getChatMember(chatId, userId)
+      } catch {
+        // unknown state: try the mute anyway
+      }
+      if (m && (m.status === 'creator' || m.status === 'administrator')) return 'failed' as const
+      if (m && (m.status === 'kicked' || m.status === 'restricted')) return 'already' as const
+      try {
+        await this.tg.restrictChatMember(chatId, userId, MUTED, Math.floor(Date.now() / 1000) + MUTE_SECONDS)
+        return 'muted' as const
+      } catch (e) {
+        console.warn('[engine] mute failed', errText(e))
+        return 'failed' as const
+      }
+    })
+  }
+
+  private unmuteMember(chatId: number, userId: number): Promise<boolean> {
+    return this.onMember(key(chatId, userId), async () => {
+      try {
+        await this.tg.restrictChatMember(chatId, userId, ALL_ALLOWED)
+        return true
+      } catch (e) {
+        console.warn('[engine] unmute failed', errText(e))
+        return false
+      }
+    })
+  }
+
+  /** Delete in batches of 100 (the Bot API limit). Returns how many were deleted. */
+  private async deleteIds(chatId: number, ids: number[], errors: string[]): Promise<number> {
+    const unique = [...new Set(ids)]
+    let done = 0
+    for (let i = 0; i < unique.length; i += 100) {
+      const batch = unique.slice(i, i + 100)
+      try {
+        await this.tg.deleteMessages(chatId, batch)
+        done += batch.length
+      } catch (e) {
+        errors.push(`delete: ${errText(e)}`)
+      }
+    }
+    return done
+  }
+
+  // ---------------------------------------------------------------- group lock
+
+  private async lockChat(g: Group): Promise<void> {
+    const chat = await this.tg.getChat(g.id)
+    // Persist before locking so a restart can always unlock.
+    g.lock = { until: Date.now() + LOCK_MS, saved: chat.permissions }
+    this.saveNow()
+    try {
+      await this.tg.setChatPermissions(g.id, MUTED)
+    } catch (e) {
+      g.lock = undefined
+      this.saveNow()
+      throw e
+    }
+    this.scheduleUnlock(g)
+  }
+
+  private scheduleUnlock(g: Group) {
+    if (!g.lock) return
+    setTimeout(() => void this.unlockChat(g), Math.max(0, g.lock.until - Date.now())).unref()
+  }
+
+  private async unlockChat(g: Group) {
+    if (!g.lock) return
+    try {
+      await this.tg.setChatPermissions(g.id, g.lock.saved ?? ALL_ALLOWED)
+      g.lock = undefined
+      this.save()
+      this.bump()
+    } catch (e) {
+      console.warn(`[engine] unlock of ${g.title} failed, retrying in 30 s:`, errText(e))
+      setTimeout(() => void this.unlockChat(g), 30_000).unref()
+    }
   }
 
   // ---------------------------------------------------------------- updates
@@ -376,15 +579,20 @@ export class Engine {
 
   private noteJoin(g: Group, user: TgUser) {
     const now = Date.now()
-    this.joins.set(`${g.id}:${user.id}`, now)
+    const k = key(g.id, user.id)
+    // The service message and the chat_member update both report a join; count it once.
+    const seen = this.joins.get(k)
+    if (seen && now - seen < 10_000) return
+    this.joins.set(k, now)
     const times = (this.joinTimes.get(g.id) ?? []).filter(t => now - t < RAID_WINDOW_MS)
     times.push(now)
     this.joinTimes.set(g.id, times)
-    // Impersonators often join silently and DM members, so flag the join itself.
-    const target = impersonates(user, g.admins)
-    if (target && !user.is_bot) {
+
+    // Impersonators often join silently and DM members, so flag a strong clone at join time.
+    const imp = impersonates(user, g.admins)
+    if (imp && imp.strength !== 'name' && !user.is_bot && !this.trusted.has(k)) {
       const a = analyzeJoin(user, { admins: g.admins })
-      this.upsert({ kind: 'impersonation', analysis: a, chatId: g.id, actor: user, messageIds: [], impersonated: target.username ? '@' + target.username : target.first_name, sample: `${displayName(user)} joined ${g.title}` })
+      this.upsert({ kind: 'impersonation', analysis: a, chatId: g.id, actor: user, messageIds: [], impersonated: adminHandle(imp.admin), sample: `${displayName(user)} joined ${g.title}` })
     }
     if (times.length >= RAID_JOINS) {
       const open = [...this.incidents.values()].find(i => i.kind === 'raid' && i.raidChat === g.id && (i.status === 'open' || i.status === 'pending'))
@@ -392,10 +600,10 @@ export class Engine {
         open.title = `${times.length} joins in 60s`
         open.updatedAt = now
         this.bump()
-      } else if (!g.lockedUntil || g.lockedUntil < now) {
-        const inc = this.newIncident('raid', 8, `${times.length} joins in 60s`, ['Join spike', g.title], '')
+      } else if (!g.lock) {
+        const inc = this.newIncident('raid', 8, `${times.length} joins in 60s`, ['Join spike'], '')
         inc.raidChat = g.id
-        inc.chats.set(g.id, [])
+        inc.pairs.set(g.id, new Map())
         this.incidents.set(inc.id, inc)
         this.bump()
       }
@@ -405,14 +613,13 @@ export class Engine {
   private onJoinRequest(r: TgChatJoinRequest) {
     const g = this.ensureGroup(r.chat)
     const a = analyzeJoin(r.from, { admins: g.admins, bio: r.bio })
-    const inc = this.newIncident('join', a.score, '', a.signals.map(s => s.label), '')
+    const inc = this.newIncident('join', a.score, a.score >= 4 ? 'Risky join request' : 'Join request', a.signals.map(s => s.label), '')
     inc.joinRequest = { chatId: g.id, userId: r.from.id }
     inc.actors.set(r.from.id, actorOf(r.from))
-    inc.chats.set(g.id, [])
-    inc.title = a.score >= 4 ? 'Risky join request' : 'Join request'
-    inc.sample = r.bio ? `Bio: ${r.bio}` : undefined
-    const imp = a.signals.find(s => s.code === 'impersonation')
-    if (imp) inc.impersonated = imp.label.replace(/^Clone of /, '')
+    inc.pairs.set(g.id, new Map([[r.from.id, []]]))
+    if (r.bio) inc.samples.set(g.id, `Bio: ${r.bio}`)
+    const imp = impersonates(r.from, g.admins)
+    if (imp) inc.impersonated = adminHandle(imp.admin)
     this.incidents.set(inc.id, inc)
     this.bump()
   }
@@ -423,10 +630,7 @@ export class Engine {
     if (chat.type === 'channel') return
     const g = this.ensureGroup(chat)
     if (msg.new_chat_members) {
-      for (const u of msg.new_chat_members) {
-        if (u.id === this.bot?.id) continue
-        if (!this.joins.has(`${g.id}:${u.id}`) || Date.now() - this.joins.get(`${g.id}:${u.id}`)! > 5000) this.noteJoin(g, u)
-      }
+      for (const u of msg.new_chat_members) if (u.id !== this.bot?.id) this.noteJoin(g, u)
       return
     }
     const user = msg.from
@@ -440,32 +644,39 @@ export class Engine {
       }, 3000)
     }
     if (g.admins.some(a => a.id === user.id)) return
-    if (this.trusted.has(`${g.id}:${user.id}`)) return
+    const k = key(g.id, user.id)
+    if (this.trusted.has(k)) return
 
     const now = Date.now()
-    const key = `${g.id}:${user.id}`
-    const recent = (this.userMsgs.get(key) ?? []).filter(m => now - m.at < 48 * 3600_000).slice(-60)
+    const recent = (this.userMsgs.get(k) ?? []).filter(m => now - m.at < 48 * 3600_000).slice(-200)
     if (!edited) recent.push({ id: msg.message_id, at: now })
-    this.userMsgs.set(key, recent)
+    this.userMsgs.set(k, recent)
 
     const text = msg.text ?? msg.caption ?? ''
-    const a0 = analyzeMessage(msg, { joinedAt: this.joins.get(key), admins: g.admins, recentCount10s: 0, sameTextGroups: 0, sameTextUsers: 0 }, now)
     let sameTextGroups = 0
     let sameTextUsers = 0
-    if (a0.fingerprint && text.length >= 12) {
-      const seen = (this.fingerprints.get(a0.fingerprint) ?? []).filter(f => now - f.at < MERGE_WINDOW_MS)
+    const fp = text.length >= 12 ? analyzeMessage(msg, { admins: [], recentCount10s: 0, sameTextGroups: 0, sameTextUsers: 0 }, now).fingerprint : ''
+    if (fp) {
+      const seen = (this.fingerprints.get(fp) ?? []).filter(f => now - f.at < MERGE_WINDOW_MS)
       sameTextGroups = new Set(seen.filter(f => f.chatId !== g.id).map(f => f.chatId)).size
       sameTextUsers = new Set(seen.filter(f => f.chatId === g.id && f.userId !== user.id).map(f => f.userId)).size
-      seen.push({ chatId: g.id, userId: user.id, at: now })
-      this.fingerprints.set(a0.fingerprint, seen.slice(-50))
+      if (!edited) seen.push({ chatId: g.id, userId: user.id, at: now })
+      this.fingerprints.set(fp, seen.slice(-50))
     }
     const recentCount10s = recent.filter(m => now - m.at < 10_000).length
-    const a = analyzeMessage(msg, { joinedAt: this.joins.get(key), admins: g.admins, recentCount10s, sameTextGroups, sameTextUsers }, now)
+    const a = analyzeMessage(msg, { joinedAt: this.joins.get(k), admins: g.admins, recentCount10s, sameTextGroups, sameTextUsers }, now)
 
-    const existing = this.findOpen(user.id, a.fingerprint)
-    if (existing) {
-      // Known offender or known text: fold the new message in, no new review.
-      this.attach(existing, g.id, user, msg.message_id, a)
+    // Already implicated in an open incident: add this message as evidence.
+    const byActor = this.findOpen(i => i.actors.has(user.id) && this.hasPair(i, g.id, user.id))
+    if (byActor) {
+      this.attach(byActor, g.id, user, msg.message_id, a)
+      return
+    }
+    // Same exact text as an open incident, from someone else: join it only with
+    // independent suspicious evidence of their own.
+    const byText = fp && a.score >= THRESHOLD_REVIEW ? this.findOpen(i => i.fingerprint === fp) : undefined
+    if (byText) {
+      this.attach(byText, g.id, user, msg.message_id, a)
       return
     }
     if (a.score >= THRESHOLD_INCIDENT) {
@@ -473,12 +684,12 @@ export class Engine {
       void this.refine(inc, g, user, a)
       return
     }
-    const joinedAt = this.joins.get(key)
+    const joinedAt = this.joins.get(k)
     const newcomer = joinedAt !== undefined && recent.length <= 3
     if (a.score >= THRESHOLD_REVIEW || (newcomer && a.urls.length > 0)) {
       const v = await review(
         { groupTitle: g.title, senderName: displayName(user), senderUsername: user.username, minutesSinceJoin: joinedAt ? Math.round((now - joinedAt) / 60_000) : undefined, signals: a.signals.map(s => s.label), text },
-        a.fingerprint,
+        reviewKey(g.id, user.id, text),
       )
       if (v && v.category !== 'ok' && v.category !== 'promo' && v.confidence !== 'low') {
         const boost = v.confidence === 'high' ? 4 : 2
@@ -493,28 +704,43 @@ export class Engine {
     }
   }
 
-  /** Ask Claude for a better label on rule-made incidents (non-blocking). */
+  /** Ask Claude about a rule-made incident (non-blocking). An "ok" verdict demotes it and lifts auto-mutes. */
   private async refine(inc: Incident, g: Group, user: TgUser, a: Analysis) {
     if (inc.verdict) return
-    const joinedAt = this.joins.get(`${g.id}:${user.id}`)
+    const joinedAt = this.joins.get(key(g.id, user.id))
     const v = await review(
       { groupTitle: g.title, senderName: displayName(user), senderUsername: user.username, minutesSinceJoin: joinedAt ? Math.round((Date.now() - joinedAt) / 60_000) : undefined, signals: a.signals.map(s => s.label), text: a.text },
-      a.fingerprint,
+      reviewKey(g.id, user.id, a.text),
     )
-    if (!v) return
+    if (!v || inc.status !== 'open') return
     inc.verdict = v
-    if (v.category !== 'ok') inc.title = v.label
+    const benign = (v.category === 'ok' || v.category === 'promo') && v.confidence !== 'low'
+    if (benign && inc.score < 10) {
+      inc.likelyOk = true
+      inc.severity = 1
+      inc.title = `Likely OK: ${v.label}`.slice(0, 28)
+      await Promise.all(inc.autoOps)
+      for (const k of [...inc.autoMuted]) {
+        const [chatId, userId] = k.split(':').map(Number)
+        if (await this.unmuteMember(chatId, userId)) inc.autoMuted.delete(k)
+      }
+    } else if (!benign) {
+      inc.title = v.label
+    }
     this.bump()
   }
 
-  private findOpen(userId: number, fingerprint: string): Incident | undefined {
+  private hasPair(i: Incident, chatId: number, userId: number): boolean {
+    return i.pairs.get(chatId)?.has(userId) ?? false
+  }
+
+  /** Open incidents only: a pending action has a frozen scope, so new evidence starts a new card. */
+  private findOpen(match: (i: Incident) => boolean): Incident | undefined {
     const now = Date.now()
     for (const inc of this.incidents.values()) {
-      if (inc.status !== 'open' && inc.status !== 'pending') continue
-      if (inc.kind === 'join' || inc.kind === 'raid') continue
+      if (inc.status !== 'open' || inc.kind === 'join' || inc.kind === 'raid') continue
       if (now - inc.updatedAt > MERGE_WINDOW_MS) continue
-      if (inc.actors.has(userId)) return inc
-      if (fingerprint && inc.fingerprint === fingerprint) return inc
+      if (match(inc)) return inc
     }
     return undefined
   }
@@ -528,11 +754,12 @@ export class Engine {
       severity: severityOf(score),
       title: title || KIND_TITLE[kind],
       signals,
+      pairs: new Map(),
       actors: new Map(),
-      chats: new Map(),
+      samples: new Map(),
       fingerprint,
       autoMuted: new Set(),
-      immediateMuted: new Set(),
+      autoOps: [],
       status: 'open',
       createdAt: now,
       updatedAt: now,
@@ -540,7 +767,7 @@ export class Engine {
   }
 
   private upsert(p: { kind: Kind; analysis: Analysis; chatId: number; actor: TgUser; messageIds: number[]; impersonated?: string; sample?: string }): Incident {
-    const existing = this.findOpen(p.actor.id, p.analysis.fingerprint)
+    const existing = this.findOpen(i => this.hasPair(i, p.chatId, p.actor.id))
     if (existing) {
       this.attach(existing, p.chatId, p.actor, p.messageIds[0], p.analysis)
       return existing
@@ -551,8 +778,8 @@ export class Engine {
     inc.impersonated = p.impersonated ?? imp?.label.replace(/^Clone of /, '')
     inc.title = defaultTitle(inc, a)
     inc.actors.set(p.actor.id, actorOf(p.actor))
-    inc.chats.set(p.chatId, [...p.messageIds])
-    inc.sample = p.sample?.slice(0, 280)
+    inc.pairs.set(p.chatId, new Map([[p.actor.id, [...p.messageIds]]]))
+    if (p.sample) inc.samples.set(p.chatId, p.sample.slice(0, 280))
     this.incidents.set(inc.id, inc)
     this.maybeAutoMute(inc, p.chatId, p.actor.id)
     this.bump()
@@ -561,12 +788,15 @@ export class Engine {
 
   private attach(inc: Incident, chatId: number, user: TgUser, messageId: number | undefined, a: Analysis) {
     inc.actors.set(user.id, actorOf(user))
-    const ids = inc.chats.get(chatId) ?? []
+    const users = inc.pairs.get(chatId) ?? new Map<number, number[]>()
+    const ids = users.get(user.id) ?? []
     if (messageId !== undefined && !ids.includes(messageId)) ids.push(messageId)
-    inc.chats.set(chatId, ids)
+    users.set(user.id, ids)
+    inc.pairs.set(chatId, users)
+    if (!inc.samples.has(chatId) && a.text) inc.samples.set(chatId, a.text.slice(0, 280))
     for (const s of a.signals) if (!inc.signals.includes(s.label)) inc.signals.push(s.label)
     inc.score = Math.max(inc.score, a.score) + 1
-    inc.severity = severityOf(inc.score)
+    if (!inc.likelyOk) inc.severity = severityOf(inc.score)
     inc.updatedAt = Date.now()
     this.maybeAutoMute(inc, chatId, user.id)
     this.bump()
@@ -574,20 +804,20 @@ export class Engine {
 
   private maybeAutoMute(inc: Incident, chatId: number, userId: number) {
     if (inc.kind !== 'scam' && inc.kind !== 'impersonation') return
-    if (inc.severity < 3 || inc.status !== 'open') return
+    if (inc.severity < 3 || inc.status !== 'open' || inc.likelyOk) return
     const g = this.groups.get(chatId)
     if (!g?.rights.restrict) return
-    const watched = [...this.sessions.values()].some(s => s.userId && s.autoMute && g.admins.some(a => a.id === s.userId))
+    // Auto-mute acts on behalf of a paired admin who can restrict here and opted in.
+    const watched = [...this.sessions.values()].some(s => s.userId && s.autoMute && this.allowed(chatId, s.userId, 'restrict'))
     if (!watched) return
-    const key = `${chatId}:${userId}`
-    if (inc.autoMuted.has(key)) return
-    inc.autoMuted.add(key)
-    this.autoMutedTotal++
-    this.tg.restrictChatMember(chatId, userId, MUTED, Math.floor(Date.now() / 1000) + MUTE_SECONDS).catch(e => {
-      inc.autoMuted.delete(key)
-      console.warn('[engine] auto-mute failed', (e as Error).message)
+    const k = key(chatId, userId)
+    if (inc.autoMuted.has(k)) return
+    inc.autoMuted.add(k) // reserve; removed below unless Warden applied the mute
+    const op = this.muteMember(chatId, userId).then(r => {
+      if (r !== 'muted') inc.autoMuted.delete(k)
       this.bump()
     })
+    inc.autoOps.push(op)
   }
 
   // ---------------------------------------------------------------- private chat (pairing)
@@ -617,41 +847,64 @@ export class Engine {
   feed(token: string): Feed | null {
     const s = this.session(token)
     if (!s) return null
+    if (!s.userId && s.codeExpires < Date.now()) {
+      s.code = this.newCode()
+      s.codeExpires = Date.now() + PAIR_CODE_MS
+      this.save()
+    }
     const groups = this.groupsFor(s)
-    const ids = new Set(groups.map(g => g.id))
-    const mine = [...this.incidents.values()].filter(i => [...i.chats.keys()].some(c => ids.has(c)))
-    const queue = mine
-      .filter(i => i.status === 'open' || i.status === 'pending')
-      .sort((a, b) => (a.status === 'pending' ? 1 : 0) - (b.status === 'pending' ? 1 : 0) || b.severity - a.severity || a.createdAt - b.createdAt)
-    const recent = mine
-      .filter(i => i.status === 'resolved' || i.status === 'dismissed')
-      .sort((a, b) => (b.resolution?.at ?? 0) - (a.resolution?.at ?? 0))
-      .slice(0, 10)
+    const queue: Card[] = []
+    let autoMuted = 0
+    if (s.userId) {
+      for (const i of this.incidents.values()) {
+        const visible = i.status === 'open' || (i.status === 'pending' && i.pending?.by === s.userId)
+        if (!visible) continue
+        const c = this.card(i, s.userId)
+        if (!c) continue
+        queue.push(c)
+        if (c.autoMuted) autoMuted++
+      }
+    }
+    queue.sort((a, b) => (a.status === 'pending' ? 1 : 0) - (b.status === 'pending' ? 1 : 0) || b.severity - a.severity || a.createdAt - b.createdAt)
     return {
       rev: this.rev,
       now: Date.now(),
       admin: s.userName,
       groups: groups.map(g => ({ id: g.id, title: g.title, rights: g.rights.delete && g.rights.restrict })),
-      stats: { scanned: groups.reduce((n, g) => n + g.scanned, 0), handled: s.handled, autoMuted: mine.filter(i => i.autoMuted.size > 0).length },
-      queue: queue.map(i => this.card(i)),
-      recent: recent.map(i => this.card(i)),
+      stats: { scanned: groups.reduce((n, g) => n + g.scanned, 0), handled: s.handled, autoMuted },
+      queue,
+      recent: (s.userId ? this.history.get(s.userId) : undefined)?.slice(0, 10) ?? [],
       llm: '',
+      codeExpires: s.userId ? undefined : s.codeExpires,
     }
   }
 
-  private card(i: Incident): Card {
-    const groups = [...i.chats.keys()].map(id => this.groups.get(id)?.title ?? String(id))
-    const messages = [...i.chats.values()].reduce((n, ids) => n + ids.length, 0)
-    const actors = i.actors.size
-    const first = [...i.actors.values()][0]
+  /** This admin's view of an incident, or null when none of it is theirs. */
+  private card(i: Incident, userId: number): Card | null {
+    const view = this.scopeFor(i, userId, 'any')
+    if (view.size === 0) return null
+    const groups = [...view.keys()].map(id => this.groups.get(id)?.title ?? String(id))
+    const actorIds = new Set<number>()
+    for (const users of view.values()) for (const u of users.keys()) actorIds.add(u)
+    const actors = [...actorIds].map(id => i.actors.get(id)).filter(Boolean) as Actor[]
+    const messages = countMessages(view)
+    const first = actors[0]
+    const who = (a: Actor) => (a.username ? '@' + a.username : a.name)
     let detail: string
     if (i.kind === 'raid') detail = `${groups[0]} · new members flooding in`
-    else if (i.kind === 'join') detail = `${first ? (first.username ? '@' + first.username : first.name) : '?'} → ${groups[0]}`
+    else if (i.kind === 'join') detail = `${first ? who(first) : '?'} → ${groups[0]}`
     else {
-      const who = actors > 1 ? `${actors} accounts` : first ? (first.username ? '@' + first.username : first.name) : 'unknown'
+      const w = actors.length > 1 ? `${actors.length} accounts` : first ? who(first) : 'unknown'
       const where = groups.length > 1 ? `${groups.length} groups` : groups[0]
-      detail = `${who} · ${where}${messages > 1 ? ` · ${messages} msgs` : ''}`
+      detail = `${w} · ${where}${messages > 1 ? ` · ${messages} msgs` : ''}`
     }
+    const sampleChat = [...view.keys()].find(c => i.samples.has(c))
+    let autoMuted = false
+    for (const k of i.autoMuted) if (view.has(Number(k.split(':')[0]))) autoMuted = true
+    const actions = this.actionsFor(i)
+      .map(id => ({ id, scope: id === 'later' || id === 'dismiss' ? view : this.scopeFor(i, userId, ACTION_RIGHT[id]) }))
+      .filter(a => a.scope.size > 0)
+      .map(a => ({ id: a.id, label: this.actionLabel(i, a.id, a.scope.size) }))
     return {
       id: i.id,
       kind: i.kind,
@@ -660,21 +913,22 @@ export class Engine {
       detail: detail.slice(0, 48),
       signals: i.signals.slice(0, 3).map(s => s.slice(0, 26)),
       groups,
-      actors,
+      actors: actors.length,
       messages,
-      autoMuted: i.autoMuted.size > 0,
+      autoMuted,
       status: i.status,
-      actions: this.actionsFor(i).map(id => ({ id, label: this.actionLabel(i, id) })),
-      pending: i.pending ? { action: i.pending.action, label: this.actionLabel(i, i.pending.action), until: i.pending.until } : undefined,
-      resolution: i.resolution,
-      ai: i.verdict ? `Claude · ${i.verdict.confidence}` : undefined,
+      actions,
+      pending: i.pending ? { action: i.pending.action, label: this.actionLabel(i, i.pending.action, i.pending.scope.size), until: i.pending.until } : undefined,
+      error: i.lastError,
+      ai: i.verdict ? `Claude: ${i.verdict.category} (${i.verdict.confidence})` : undefined,
       createdAt: i.createdAt,
-      sample: i.sample,
+      sample: sampleChat !== undefined ? i.samples.get(sampleChat) : undefined,
       warning: i.warning,
     }
   }
 
   private actionsFor(i: Incident): ActionId[] {
+    if (i.likelyOk) return ['dismiss', 'delete', 'mute', 'ban']
     switch (i.kind) {
       case 'join':
         return i.score >= 4 ? ['decline', 'approve', 'later'] : ['approve', 'decline', 'later']
@@ -689,11 +943,11 @@ export class Engine {
     }
   }
 
-  private actionLabel(i: Incident, a: ActionId): string {
-    const n = i.chats.size
-    const scope = n > 1 ? ` (${n} groups)` : ''
-    if (a === 'ban' || a === 'delete') return ACTION_LABEL[a] + scope
+  private actionLabel(i: Incident, a: ActionId, chats: number): string {
+    const scope = chats > 1 ? ` (${chats} groups)` : ''
+    if (a === 'ban' || a === 'delete' || a === 'mute') return ACTION_LABEL[a] + scope
     if (a === 'dismiss' && i.kind === 'raid') return 'Ignore'
+    if (a === 'dismiss' && i.kind === 'join') return 'Ignore'
     return ACTION_LABEL[a]
   }
 
@@ -705,168 +959,271 @@ export class Engine {
     const i = this.incidents.get(incidentId)
     if (!s?.userId) return { ok: false, error: 'not paired' }
     if (!i) return { ok: false, error: 'unknown incident' }
-    if (!this.canModerate(s, i)) return { ok: false, error: 'not an admin of this group' }
     if (i.status !== 'open') return { ok: false, error: `already ${i.status}` }
     if (!this.actionsFor(i).includes(action)) return { ok: false, error: 'action not available' }
+    const scope = this.scopeFor(i, s.userId, ACTION_RIGHT[action])
+    if (scope.size === 0) return { ok: false, error: 'no admin rights for this' }
+    const userId = s.userId
 
     if (action === 'later') {
       i.createdAt = Date.now()
-      i.severity = Math.max(1, i.severity - 1) as Incident['severity']
       this.bump()
-      return { ok: true, card: this.card(i) }
+      return { ok: true, card: this.card(i, userId) ?? undefined }
     }
 
+    i.lastError = undefined
+    const immediate = new Set<string>()
+    const ops: Promise<void>[] = []
     // Stop the bleeding right away with a step that can be undone.
     if (action === 'ban' || action === 'ban_warn' || action === 'mute') {
-      for (const [chatId] of i.chats) {
-        for (const [userId] of i.actors) {
-          const key = `${chatId}:${userId}`
-          if (i.autoMuted.has(key) || i.immediateMuted.has(key)) continue
-          i.immediateMuted.add(key)
-          this.tg.restrictChatMember(chatId, userId, MUTED, Math.floor(Date.now() / 1000) + MUTE_SECONDS).catch(() => i.immediateMuted.delete(key))
+      for (const [chatId, users] of scope) {
+        for (const u of users.keys()) {
+          const k = key(chatId, u)
+          if (i.autoMuted.has(k)) continue
+          ops.push(this.muteMember(chatId, u).then(r => void (r === 'muted' && immediate.add(k))))
         }
       }
     }
     if (action === 'ban_warn' && !i.warning) {
-      const g = this.groups.get([...i.chats.keys()][0])
+      const g = this.groups.get([...scope.keys()][0])
       void draftWarning({ groupTitle: g?.title ?? '', kind: i.kind, label: i.title, signals: i.signals, impersonated: i.impersonated }).then(w => {
-        i.warning = w
+        i.warning ??= w
         this.bump()
       })
     }
 
-    const until = Date.now() + UNDO_MS
+    const until = Date.now() + this.undoMs
     i.status = 'pending'
-    i.pending = { action, by: s.userId, until, timer: setTimeout(() => void this.commit(i, s), UNDO_MS) }
+    i.pending = { action, by: userId, token, scope, until, immediate, mutes: Promise.all(ops).then(() => undefined), timer: setTimeout(() => void this.commit(i), this.undoMs) }
     this.bump()
-    return { ok: true, card: this.card(i) }
+    return { ok: true, card: this.card(i, userId) ?? undefined }
   }
 
-  undo(token: string, incidentId: string): { ok: boolean; error?: string } {
+  async undo(token: string, incidentId?: string): Promise<{ ok: boolean; error?: string; id?: string }> {
     const s = this.session(token)
-    const i = this.incidents.get(incidentId)
-    if (!s?.userId || !i) return { ok: false, error: 'unknown' }
-    if (i.status !== 'pending' || !i.pending) return { ok: false, error: 'nothing to undo' }
-    clearTimeout(i.pending.timer)
+    if (!s?.userId) return { ok: false, error: 'not paired' }
+    const i = incidentId
+      ? this.incidents.get(incidentId)
+      : [...this.incidents.values()].filter(x => x.status === 'pending' && x.pending?.by === s.userId).sort((a, b) => b.pending!.until - a.pending!.until)[0]
+    if (!i || i.status !== 'pending' || !i.pending) return { ok: false, error: 'nothing to undo' }
+    if (i.pending.by !== s.userId) return { ok: false, error: 'only the admin who acted can undo' }
+    const p = i.pending
+    clearTimeout(p.timer)
     i.pending = undefined
     i.status = 'open'
-    for (const key of i.immediateMuted) {
-      const [chatId, userId] = key.split(':').map(Number)
-      void this.unmute(chatId, userId)
-    }
-    i.immediateMuted.clear()
     this.bump()
-    return { ok: true }
+    // Wait for this action's mutes to land, then lift exactly those (in order per member).
+    await p.mutes
+    await Promise.all([...p.immediate].map(k => {
+      const [chatId, userId] = k.split(':').map(Number)
+      return this.unmuteMember(chatId, userId)
+    }))
+    return { ok: true, id: i.id }
   }
 
-  /** Undo the most recent pending action of this admin (long press on the glasses). */
-  undoLast(token: string): { ok: boolean; id?: string } {
-    const s = this.session(token)
-    if (!s?.userId) return { ok: false }
-    const last = [...this.incidents.values()].filter(i => i.status === 'pending' && i.pending?.by === s.userId).sort((a, b) => b.pending!.until - a.pending!.until)[0]
-    if (!last) return { ok: false }
-    return { ...this.undo(token, last.id), id: last.id }
-  }
-
-  private canModerate(s: Session, i: Incident): boolean {
-    return [...i.chats.keys()].every(c => this.groups.get(c)?.admins.some(a => a.id === s.userId))
-  }
-
-  private async unmute(chatId: number, userId: number) {
-    const g = await this.tg.getChat(chatId).catch(() => null)
-    const perms: TgChatPermissions = g?.permissions ?? { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_video_notes: true, can_send_voice_notes: true, can_send_polls: true, can_send_other_messages: true, can_add_web_page_previews: true }
-    await this.tg.restrictChatMember(chatId, userId, perms).catch(e => console.warn('[engine] unmute failed', (e as Error).message))
-  }
-
-  private async commit(i: Incident, s: Session) {
-    if (i.status !== 'pending' || !i.pending) return
-    const action = i.pending.action
-    i.pending = undefined
-    const done: string[] = []
-    const failed: string[] = []
-    const run = async (label: string, p: Promise<unknown>) => {
-      try {
-        await p
-        return true
-      } catch (e) {
-        failed.push(`${label}: ${e instanceof TelegramError ? e.message.replace(/^\w+: /, '') : String(e)}`)
-        return false
-      }
+  /** Re-check with Telegram that the admin still holds the right in this chat. */
+  private async stillAllowed(chatId: number, userId: number, right: Right): Promise<boolean> {
+    try {
+      const m = await this.tg.getChatMember(chatId, userId)
+      if (m.status === 'creator') return true
+      if (m.status !== 'administrator') return false
+      if (right === 'any') return true
+      const has = right === 'restrict' ? m.can_restrict_members : right === 'delete' ? m.can_delete_messages : m.can_invite_users
+      return !!has && !!this.groups.get(chatId)?.rights[right]
+    } catch {
+      return this.allowed(chatId, userId, right)
     }
-    const chats = [...i.chats.entries()]
-    const actors = [...i.actors.keys()]
+  }
 
+  private async commit(i: Incident) {
+    const p = i.pending
+    if (i.status !== 'pending' || !p) return
+    i.pending = undefined
+    await p.mutes
+    const s = this.sessions.get(p.token)
+    const errors: string[] = []
+    const okPairs = new Set<string>() // `${chat}:${user}` handled, or `${chat}:*` for chat-level actions
+    const right = ACTION_RIGHT[p.action]
+
+    const scope: Pairs = new Map()
+    for (const [chatId, users] of p.scope) {
+      if (await this.stillAllowed(chatId, p.by, right)) scope.set(chatId, users)
+      else errors.push(`no longer admin in ${this.groups.get(chatId)?.title ?? chatId}`)
+    }
+
+    let removed = 0
+    let banned = 0
+    const action = p.action
     if (action === 'ban' || action === 'ban_warn') {
-      let banned = 0
-      let removed = 0
-      for (const [chatId, ids] of chats) {
-        for (const userId of actors) if (await run('ban', this.tg.banChatMember(chatId, userId, true))) banned++
-        const all = new Set(ids)
-        for (const userId of actors) for (const m of this.userMsgs.get(`${chatId}:${userId}`) ?? []) all.add(m.id)
-        if (all.size && (await run('delete', this.tg.deleteMessages(chatId, [...all])))) removed += all.size
-      }
-      done.push(`Banned ${actors.length > 1 ? `${actors.length} accounts` : ''} in ${chats.length} group${chats.length > 1 ? 's' : ''}`.replace('  ', ' '), `${removed} msgs removed`)
-      if (action === 'ban_warn') {
-        const g = this.groups.get(chats[0][0])
-        const text = i.warning ?? (await draftWarning({ groupTitle: g?.title ?? '', kind: i.kind, label: i.title, signals: i.signals, impersonated: i.impersonated }))
-        i.warning = text
-        let posted = 0
-        for (const [chatId] of chats) if (await run('warn', this.tg.sendMessage(chatId, text))) posted++
-        if (posted) done.push('warning posted')
+      for (const [chatId, users] of scope) {
+        let any = false
+        for (const [u, ids] of users) {
+          try {
+            await this.tg.banChatMember(chatId, u, true)
+            okPairs.add(key(chatId, u))
+            banned++
+            any = true
+            const all = [...ids, ...(this.userMsgs.get(key(chatId, u)) ?? []).map(m => m.id)]
+            removed += await this.deleteIds(chatId, all, errors)
+          } catch (e) {
+            errors.push(`ban: ${errText(e)}`)
+          }
+        }
+        if (any && action === 'ban_warn') {
+          const g = this.groups.get(chatId)
+          const text = i.warning ?? (await draftWarning({ groupTitle: g?.title ?? '', kind: i.kind, label: i.title, signals: i.signals, impersonated: i.impersonated }))
+          i.warning = text
+          await this.tg.sendMessage(chatId, text).catch(e => errors.push(`warn: ${errText(e)}`))
+        }
       }
     } else if (action === 'delete') {
-      let removed = 0
-      for (const [chatId, ids] of chats) if (ids.length && (await run('delete', this.tg.deleteMessages(chatId, ids)))) removed += ids.length
-      done.push(`${removed} msgs removed`)
-    } else if (action === 'mute') {
-      // The mute already happened in act(); remove what was posted.
-      for (const [chatId, ids] of chats) if (ids.length) await run('delete', this.tg.deleteMessages(chatId, ids))
-      done.push(`Muted 24h in ${chats.length} group${chats.length > 1 ? 's' : ''}`)
-    } else if (action === 'dismiss') {
-      for (const [chatId] of chats) for (const userId of actors) this.trusted.add(`${chatId}:${userId}`)
-      for (const key of i.autoMuted) {
-        const [chatId, userId] = key.split(':').map(Number)
-        await this.unmute(chatId, userId)
+      for (const [chatId, users] of scope) {
+        for (const [u, ids] of users) {
+          if (ids.length === 0) continue
+          const n = await this.deleteIds(chatId, ids, errors)
+          removed += n
+          if (n === new Set(ids).size) okPairs.add(key(chatId, u))
+        }
       }
-      if (i.kind === 'raid') done.push('Ignored')
-      else done.push('Trusted, mute lifted')
+    } else if (action === 'mute') {
+      for (const [chatId, users] of scope) {
+        for (const [u, ids] of users) {
+          const k = key(chatId, u)
+          const muted = p.immediate.has(k) || i.autoMuted.has(k) || (await this.muteMember(chatId, u)) !== 'failed'
+          if (!muted) {
+            errors.push('mute failed')
+            continue
+          }
+          okPairs.add(k)
+          if (ids.length) removed += await this.deleteIds(chatId, ids, errors)
+        }
+      }
+    } else if (action === 'dismiss') {
+      await Promise.all(i.autoOps)
+      for (const [chatId, users] of scope) {
+        okPairs.add(`${chatId}:*`)
+        for (const u of users.keys()) {
+          const k = key(chatId, u)
+          this.trusted.add(k)
+          okPairs.add(k)
+          if (i.autoMuted.has(k) && (await this.unmuteMember(chatId, u))) i.autoMuted.delete(k)
+        }
+      }
       this.save()
     } else if (action === 'approve' || action === 'decline') {
       const jr = i.joinRequest!
-      const ok = await run(action, action === 'approve' ? this.tg.approveChatJoinRequest(jr.chatId, jr.userId) : this.tg.declineChatJoinRequest(jr.chatId, jr.userId))
-      if (ok) done.push(action === 'approve' ? 'Approved' : 'Declined')
+      if (scope.has(jr.chatId)) {
+        try {
+          await (action === 'approve' ? this.tg.approveChatJoinRequest(jr.chatId, jr.userId) : this.tg.declineChatJoinRequest(jr.chatId, jr.userId))
+          okPairs.add(key(jr.chatId, jr.userId))
+          okPairs.add(`${jr.chatId}:*`)
+        } catch (e) {
+          errors.push(`${action}: ${errText(e)}`)
+        }
+      }
     } else if (action === 'lock') {
-      const chatId = i.raidChat!
-      const g = this.groups.get(chatId)
-      const chat = await this.tg.getChat(chatId).catch(() => null)
-      if (g) g.savedPermissions = chat?.permissions
-      if (await run('lock', this.tg.setChatPermissions(chatId, MUTED))) {
-        done.push('Group locked 10 min')
-        if (g) g.lockedUntil = Date.now() + LOCK_MS
-        setTimeout(() => {
-          const perms = g?.savedPermissions ?? { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_video_notes: true, can_send_voice_notes: true, can_send_polls: true, can_send_other_messages: true, can_add_web_page_previews: true }
-          void this.tg.setChatPermissions(chatId, perms).catch(e => console.warn('[engine] unlock failed', (e as Error).message))
-          if (g) g.lockedUntil = undefined
-        }, LOCK_MS)
+      const g = this.groups.get(i.raidChat!)
+      if (g && scope.has(g.id)) {
+        try {
+          await this.lockChat(g)
+          okPairs.add(`${g.id}:*`)
+        } catch (e) {
+          errors.push(`lock: ${errText(e)}`)
+        }
       }
     }
 
-    i.status = action === 'dismiss' ? 'dismissed' : 'resolved'
-    i.resolution = { action, summary: [...done, ...(failed.length ? [`${failed.length} failed`] : [])].join(' · ').slice(0, 60), at: Date.now() }
-    if (failed.length) console.warn(`[engine] ${action} on ${i.id}:`, failed.join('; '))
-    s.handled++
+    if (okPairs.size === 0) {
+      // Nothing happened: keep the card open and say why.
+      i.status = 'open'
+      i.lastError = (errors[0] ?? 'failed').slice(0, 40)
+      if (errors.length) console.warn(`[engine] ${action} on ${i.id} failed:`, errors.join('; '))
+      this.bump()
+      return
+    }
+
+    // Remove what was handled; anything left (other admins' groups, failures) stays open.
+    for (const [chatId, users] of [...i.pairs]) {
+      if (okPairs.has(`${chatId}:*`)) {
+        i.pairs.delete(chatId)
+        continue
+      }
+      for (const u of [...users.keys()]) if (okPairs.has(key(chatId, u))) users.delete(u)
+      if (users.size === 0 && scope.has(chatId)) i.pairs.delete(chatId)
+    }
+
+    const chats = new Set([...okPairs].map(k => k.split(':')[0])).size
+    const parts: string[] = []
+    if (action === 'ban' || action === 'ban_warn') parts.push(`Banned ${banned > 1 ? `${banned}x ` : ''}in ${chats} group${chats > 1 ? 's' : ''}`, `${removed} msg${removed === 1 ? '' : 's'} removed`)
+    else if (action === 'delete') parts.push(`${removed} msg${removed === 1 ? '' : 's'} removed`)
+    else if (action === 'mute') parts.push(`Muted 24h in ${chats} group${chats > 1 ? 's' : ''}`)
+    else if (action === 'dismiss') parts.push(i.kind === 'raid' || i.kind === 'join' ? 'Ignored' : 'Trusted, mute lifted')
+    else if (action === 'approve') parts.push('Approved')
+    else if (action === 'decline') parts.push('Declined')
+    else if (action === 'lock') parts.push('Group locked 10 min')
+    if (action === 'ban_warn' && i.warning) parts.push('warning posted')
+    if (errors.length) parts.push(`${errors.length} failed`)
+    const summary = parts.join(' · ').slice(0, 60)
+    if (errors.length) console.warn(`[engine] ${action} on ${i.id}:`, errors.join('; '))
+
+    const done = i.pairs.size === 0
+    i.status = done ? (action === 'dismiss' ? 'dismissed' : 'resolved') : 'open'
+    i.lastError = done ? undefined : errors[0]?.slice(0, 40)
+    const snap: Card = {
+      ...(this.card(i, p.by) ?? this.cardSkeleton(i)),
+      status: action === 'dismiss' ? 'dismissed' : 'resolved',
+      actions: [],
+      resolution: { action, summary, at: Date.now() },
+      warning: action === 'ban_warn' ? i.warning : undefined,
+    }
+    const h = this.history.get(p.by) ?? []
+    h.unshift(snap)
+    this.history.set(p.by, h.slice(0, 30))
+    if (s) s.handled++
     this.save()
     this.bump()
   }
 
-  /** Development aid: incidents and groups for the phone page. */
-  debug() {
-    return { groups: [...this.groups.values()], incidents: this.incidents.size, sessions: this.sessions.size, rev: this.rev }
+  private cardSkeleton(i: Incident): Card {
+    return {
+      id: i.id,
+      kind: i.kind,
+      severity: i.severity,
+      title: i.title.slice(0, 28),
+      detail: '',
+      signals: [],
+      groups: [],
+      actors: 0,
+      messages: 0,
+      autoMuted: false,
+      status: i.status,
+      actions: [],
+      createdAt: i.createdAt,
+    }
+  }
+}
+
+function adminInfo(m: TgChatMember): AdminInfo {
+  const creator = m.status === 'creator'
+  return {
+    id: m.user.id,
+    first_name: m.user.first_name,
+    last_name: m.user.last_name,
+    username: m.user.username,
+    creator,
+    restrict: creator || !!m.can_restrict_members,
+    delete: creator || !!m.can_delete_messages,
+    invite: creator || !!m.can_invite_users,
   }
 }
 
 function actorOf(u: TgUser): Actor {
   return { id: u.id, name: displayName(u), username: u.username, isBot: u.is_bot }
+}
+
+/** Classifier cache key: the exact message from this sender in this group. */
+function reviewKey(chatId: number, userId: number, text: string): string {
+  return createHash('sha1').update(`${chatId}\n${userId}\n${text}`).digest('hex')
 }
 
 function defaultTitle(inc: Incident, a: Analysis): string {
