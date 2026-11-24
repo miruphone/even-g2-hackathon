@@ -1,6 +1,8 @@
 #include "G2SimPlayerController.h"
 
+#include "Camera/CameraComponent.h"
 #include "Engine/GameInstance.h"
+#include "HeadMountedDisplayFunctionLibrary.h"
 #include "Engine/World.h"
 #include "GameFramework/GameModeBase.h"
 #include "G2SimCharacter.h"
@@ -15,6 +17,9 @@ namespace
 	constexpr double ImuPeriod = 0.05; // 20 Hz to the hub; the app picks its own report pace
 	constexpr double LocPeriod = 1.0;
 	constexpr double MetersPerDegLat = 111320.0;
+	constexpr float SnapTurnDeg = 30.f;
+	constexpr float StickPress = 0.7f;   // a stick flick counts past this...
+	constexpr float StickRelease = 0.3f; // ...and re-arms below this
 }
 
 AG2SimPlayerController::AG2SimPlayerController()
@@ -31,9 +36,32 @@ UG2HubSubsystem* AG2SimPlayerController::GetHub() const
 void AG2SimPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
-	if (IsLocalController())
+	if (!IsLocalController())
 	{
-		SetMouseFree(false);
+		return;
+	}
+	bVR = UHeadMountedDisplayFunctionLibrary::IsHeadMountedDisplayEnabled();
+	if (bVR)
+	{
+		if (AG2SimCharacter* C = Cast<AG2SimCharacter>(GetPawn()))
+		{
+			C->SetupVR();
+		}
+		SetControlRotation(FRotator(0, GetControlRotation().Yaw, 0));
+		bHelp = false;
+	}
+	SetMouseFree(false);
+}
+
+void AG2SimPlayerController::OnPossess(APawn* InPawn)
+{
+	Super::OnPossess(InPawn);
+	if (bVR)
+	{
+		if (AG2SimCharacter* C = Cast<AG2SimCharacter>(InPawn))
+		{
+			C->SetupVR();
+		}
 	}
 }
 
@@ -102,7 +130,7 @@ void AG2SimPlayerController::PlayerTick(float DeltaTime)
 
 	// Close a held long press whatever mode we are in (menu, free mouse),
 	// including a release missed while the window had no focus.
-	if (bLongPressing && !IsInputKeyDown(EKeys::F))
+	if (bLongPressing && !IsInputKeyDown(LongPressKey))
 	{
 		EndLongPress();
 	}
@@ -127,7 +155,11 @@ void AG2SimPlayerController::PlayerTick(float DeltaTime)
 			SetMouseFree(!bMouseFree);
 		}
 	}
-	if (bMouseFree)
+	if (bVR)
+	{
+		UpdateVrInput(DeltaTime);
+	}
+	if (bMouseFree && !bVR)
 	{
 		// Click back into the window to resume; that click is not a tap.
 		if (WasInputKeyJustPressed(EKeys::LeftMouseButton))
@@ -165,12 +197,22 @@ void AG2SimPlayerController::UpdateLook(float DeltaTime)
 	float Dx = 0.f, Dy = 0.f;
 	GetInputMouseDelta(Dx, Dy);
 
+	FRotator R = GetControlRotation();
+	if (bVR)
+	{
+		// The headset owns pitch and roll; the mouse may still turn the body.
+		R.Yaw = FRotator::NormalizeAxis(R.Yaw + Dx * MouseSensitivity);
+		R.Pitch = 0.f;
+		R.Roll = 0.f;
+		SetControlRotation(R);
+		return;
+	}
+
 	float Target = 0.f;
 	if (IsInputKeyDown(EKeys::Q)) Target -= MaxRoll;
 	if (IsInputKeyDown(EKeys::E)) Target += MaxRoll;
 	HeadRoll = FMath::FInterpConstantTo(HeadRoll, Target, DeltaTime, RollSpeed);
 
-	FRotator R = GetControlRotation();
 	R.Yaw = FRotator::NormalizeAxis(R.Yaw + Dx * MouseSensitivity);
 	R.Pitch = FMath::Clamp(FRotator::NormalizeAxis(R.Pitch) + Dy * MouseSensitivity, -85.f, 85.f);
 	R.Roll = HeadRoll;
@@ -197,7 +239,8 @@ void AG2SimPlayerController::UpdateMove()
 
 	if (const ACharacter* C = Cast<ACharacter>(P))
 	{
-		C->GetCharacterMovement()->MaxWalkSpeed = IsInputKeyDown(EKeys::LeftShift) ? AG2SimCharacter::RunSpeed : AG2SimCharacter::WalkSpeed;
+		const bool bRun = IsInputKeyDown(EKeys::LeftShift) || (bVR && IsInputKeyDown(EKeys::OculusTouch_Left_Thumbstick_Click));
+		C->GetCharacterMovement()->MaxWalkSpeed = bRun ? AG2SimCharacter::RunSpeed : AG2SimCharacter::WalkSpeed;
 	}
 }
 
@@ -221,27 +264,63 @@ void AG2SimPlayerController::UpdateGlassesInput()
 	if (WasInputKeyJustPressed(EKeys::MouseScrollUp) || WasInputKeyJustPressed(EKeys::Up)) Gesture(EG2Gesture::Up);
 	if (WasInputKeyJustPressed(EKeys::MouseScrollDown) || WasInputKeyJustPressed(EKeys::Down)) Gesture(EG2Gesture::Down);
 	if (WasInputKeyJustPressed(EKeys::X)) Gesture(EG2Gesture::Double);
-	if (WasInputKeyJustPressed(EKeys::F) && !bLongPressing)
+	if (WasInputKeyJustPressed(EKeys::F))
 	{
-		bLongPressing = true;
-		LongPressSource = Source;
-		Gesture(EG2Gesture::LongStart);
+		StartLongPress(EKeys::F);
 	}
-
 	if (WasInputKeyJustPressed(EKeys::RightMouseButton) || WasInputKeyJustPressed(EKeys::C))
 	{
-		const UG2HubSubsystem* Hub = GetHub();
-		if (Hub && Hub->GetMenu().Num() > 0)
-		{
-			EndLongPress();
-			bMenuOpen = true;
-			MenuIndex = 0;
-		}
-		else
-		{
-			Note(TEXT("no context menu on this screen"));
-		}
+		OpenMenu();
 	}
+}
+
+void AG2SimPlayerController::StartLongPress(const FKey& Key)
+{
+	if (bLongPressing)
+	{
+		return;
+	}
+	bLongPressing = true;
+	LongPressSource = Source;
+	LongPressKey = Key;
+	Gesture(EG2Gesture::LongStart);
+}
+
+void AG2SimPlayerController::OpenMenu()
+{
+	const UG2HubSubsystem* Hub = GetHub();
+	if (Hub && Hub->GetMenu().Num() > 0)
+	{
+		EndLongPress();
+		bMenuOpen = true;
+		MenuIndex = 0;
+	}
+	else
+	{
+		Note(TEXT("no context menu on this screen"));
+	}
+}
+
+void AG2SimPlayerController::MoveMenu(int32 Delta)
+{
+	const UG2HubSubsystem* Hub = GetHub();
+	const int32 N = Hub ? Hub->GetMenu().Num() : 0;
+	if (N > 0)
+	{
+		MenuIndex = ((MenuIndex + Delta) % N + N) % N;
+	}
+}
+
+void AG2SimPlayerController::SendMenuSelection()
+{
+	UG2HubSubsystem* Hub = GetHub();
+	if (Hub && Hub->GetMenu().IsValidIndex(MenuIndex))
+	{
+		const FG2MenuItem& Item = Hub->GetMenu()[MenuIndex];
+		Hub->SendMenu(Item.Id);
+		Note(FString::Printf(TEXT("menu: %s"), *Item.Label));
+	}
+	bMenuOpen = false;
 }
 
 void AG2SimPlayerController::UpdateMenuInput()
@@ -254,14 +333,11 @@ void AG2SimPlayerController::UpdateMenuInput()
 		return;
 	}
 	MenuIndex = FMath::Clamp(MenuIndex, 0, N - 1);
-	if (WasInputKeyJustPressed(EKeys::MouseScrollUp) || WasInputKeyJustPressed(EKeys::Up)) MenuIndex = (MenuIndex + N - 1) % N;
-	if (WasInputKeyJustPressed(EKeys::MouseScrollDown) || WasInputKeyJustPressed(EKeys::Down)) MenuIndex = (MenuIndex + 1) % N;
+	if (WasInputKeyJustPressed(EKeys::MouseScrollUp) || WasInputKeyJustPressed(EKeys::Up)) MoveMenu(-1);
+	if (WasInputKeyJustPressed(EKeys::MouseScrollDown) || WasInputKeyJustPressed(EKeys::Down)) MoveMenu(1);
 	if (WasInputKeyJustPressed(EKeys::LeftMouseButton) || WasInputKeyJustPressed(EKeys::Enter))
 	{
-		const FG2MenuItem& Item = Hub->GetMenu()[MenuIndex];
-		Hub->SendMenu(Item.Id);
-		Note(FString::Printf(TEXT("menu: %s"), *Item.Label));
-		bMenuOpen = false;
+		SendMenuSelection();
 	}
 	if (WasInputKeyJustPressed(EKeys::RightMouseButton) || WasInputKeyJustPressed(EKeys::C))
 	{
@@ -279,7 +355,9 @@ void AG2SimPlayerController::UpdateSensors(float DeltaTime)
 	}
 
 	// Head pose as IMU: x = pitch (nod), y = yaw (shake), z = roll (tilt), degrees.
-	const FRotator R = GetControlRotation();
+	// The camera carries the real head pose in VR and the mouse look + Q/E roll on desktop.
+	const AG2SimCharacter* C = Cast<AG2SimCharacter>(P);
+	const FRotator R = C && C->GetCamera() ? C->GetCamera()->GetComponentRotation() : GetControlRotation();
 	LastImu = FVector(FRotator::NormalizeAxis(R.Pitch), FRotator::NormalizeAxis(R.Yaw), FRotator::NormalizeAxis(R.Roll));
 	ImuAccum += DeltaTime;
 	if (ImuAccum >= ImuPeriod)
@@ -302,4 +380,100 @@ void AG2SimPlayerController::UpdateSensors(float DeltaTime)
 		const double Heading = FMath::Fmod(R.Yaw + 360.0, 360.0); // UE yaw is clockwise from +X (north)
 		Hub->SendLocation(Lat, Lon, Heading, P->GetVelocity().Size2D() / 100.0);
 	}
+}
+
+void AG2SimPlayerController::UpdateVrInput(float DeltaTime)
+{
+	using K = EKeys;
+	const AG2SimCharacter* C = Cast<AG2SimCharacter>(GetPawn());
+
+	// Walk where the head looks (yaw only); left stick click to run.
+	if (C)
+	{
+		const float Yaw = C->GetCamera()->GetComponentRotation().Yaw;
+		const FRotator YawOnly(0, Yaw, 0);
+		GetPawn()->AddMovementInput(YawOnly.Vector(), GetInputAnalogKeyState(K::OculusTouch_Left_Thumbstick_Y));
+		GetPawn()->AddMovementInput(FRotationMatrix(YawOnly).GetUnitAxis(EAxis::Y), GetInputAnalogKeyState(K::OculusTouch_Left_Thumbstick_X));
+	}
+
+	const float RX = GetInputAnalogKeyState(K::OculusTouch_Right_Thumbstick_X);
+	const float RY = GetInputAnalogKeyState(K::OculusTouch_Right_Thumbstick_Y);
+
+	// Hold left grip: the right stick moves / resizes the glasses display.
+	if (IsInputKeyDown(K::OculusTouch_Left_Grip_Click))
+	{
+		VrPitchDeg = FMath::Clamp(VrPitchDeg + RY * DeltaTime * 10.f, -25.f, 25.f);
+		VrWidthDeg = FMath::Clamp(VrWidthDeg + RX * DeltaTime * 10.f, 10.f, 60.f);
+		bStickLatched = true; // no flick when the grip is let go mid-push
+		return;
+	}
+
+	// Right stick flicks: left / right snap turn, up / down swipe (or menu selection).
+	if (bStickLatched)
+	{
+		if (FMath::Abs(RX) < StickRelease && FMath::Abs(RY) < StickRelease)
+		{
+			bStickLatched = false;
+		}
+	}
+	else if (FMath::Max(FMath::Abs(RX), FMath::Abs(RY)) > StickPress)
+	{
+		bStickLatched = true;
+		if (FMath::Abs(RX) > FMath::Abs(RY))
+		{
+			SnapTurn(FMath::Sign(RX) * SnapTurnDeg);
+		}
+		else if (bMenuOpen)
+		{
+			MoveMenu(RY > 0 ? -1 : 1);
+		}
+		else
+		{
+			Gesture(RY > 0 ? EG2Gesture::Up : EG2Gesture::Down);
+		}
+	}
+
+	if (WasInputKeyJustPressed(K::OculusTouch_Left_Y_Click))
+	{
+		bHelp = !bHelp; // the info panel in VR
+	}
+
+	if (bMenuOpen)
+	{
+		if (WasInputKeyJustPressed(K::OculusTouch_Right_Trigger_Click)) SendMenuSelection();
+		if (WasInputKeyJustPressed(K::OculusTouch_Right_Grip_Click)) bMenuOpen = false;
+		return;
+	}
+
+	if (WasInputKeyJustPressed(K::OculusTouch_Left_X_Click))
+	{
+		EndLongPress();
+		Source = Source == EG2Source::Right ? EG2Source::Ring : Source == EG2Source::Ring ? EG2Source::Left : EG2Source::Right;
+		Note(FString::Printf(TEXT("source: %s"), UG2HubSubsystem::SourceName(Source)));
+	}
+	if (WasInputKeyJustPressed(K::OculusTouch_Right_Trigger_Click)) Gesture(EG2Gesture::Tap);
+	if (WasInputKeyJustPressed(K::OculusTouch_Right_A_Click)) Gesture(EG2Gesture::Double);
+	if (WasInputKeyJustPressed(K::OculusTouch_Right_B_Click)) StartLongPress(K::OculusTouch_Right_B_Click);
+	if (WasInputKeyJustPressed(K::OculusTouch_Right_Grip_Click)) OpenMenu();
+}
+
+void AG2SimPlayerController::SnapTurn(float DeltaYaw)
+{
+	FRotator R = GetControlRotation();
+	R.Yaw = FRotator::NormalizeAxis(R.Yaw + DeltaYaw);
+	SetControlRotation(R);
+
+	// Turn around the head, not the tracking origin: when the player stands
+	// away from the origin, rotating the body alone would swing the view.
+	APawn* P = GetPawn();
+	const AG2SimCharacter* C = Cast<AG2SimCharacter>(P);
+	if (!P || !C)
+	{
+		return;
+	}
+	const FVector Before = C->GetCamera()->GetComponentLocation();
+	P->SetActorRotation(FRotator(0, R.Yaw, 0));
+	FVector Shift = Before - C->GetCamera()->GetComponentLocation();
+	Shift.Z = 0;
+	P->AddActorWorldOffset(Shift, true);
 }

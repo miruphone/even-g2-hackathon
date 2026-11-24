@@ -15,6 +15,12 @@
  *   Right click or C: context menu (wheel to choose, click to send)
  *   G show / hide glasses, [ ] size, PgUp / PgDn height, H help, Esc free mouse
  *
+ * VR (run with -vr, Quest via Link / Air Link as the OpenXR runtime):
+ *   Left stick walk (click: run), right stick left / right snap turn
+ *   Right trigger tap, right stick up / down swipe, A double tap, hold B long press
+ *   Right grip context menu (stick to choose, trigger to send), X input source,
+ *   Y info panel, hold left grip + right stick: display height / size
+ *
  * The head pose is streamed as IMU while the app has IMU on, and the
  * position is sent as GPS (+X north, +Y east from Tokyo Station).
  */
@@ -29,8 +35,12 @@ public:
 	virtual void BeginPlay() override;
 	virtual void PlayerTick(float DeltaTime) override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+	virtual void OnPossess(APawn* InPawn) override;
 
 	// UI state read by AG2SimHUD.
+	bool bVR = false;
+	float VrWidthDeg = 24.f; // apparent width of the glasses display
+	float VrPitchDeg = 2.f;  // its height above the view centre
 	EG2Source Source = EG2Source::Right;
 	bool bMenuOpen = false;
 	int32 MenuIndex = 0;
@@ -62,9 +72,17 @@ private:
 	void UpdateGlassesInput();
 	void UpdateMenuInput();
 	void UpdateSensors(float DeltaTime);
+	void UpdateVrInput(float DeltaTime);
+	void OpenMenu();
+	void MoveMenu(int32 Delta);
+	void SendMenuSelection();
+	void StartLongPress(const FKey& Key);
+	void SnapTurn(float DeltaYaw);
 
 	float HeadRoll = 0.f;
 	EG2Source LongPressSource = EG2Source::Right;
+	FKey LongPressKey;
+	bool bStickLatched = false;
 	double ImuAccum = 0.0;
 	double LocAccum = 0.0;
 };

@@ -1,6 +1,10 @@
 #include "G2SimHUD.h"
 
+#include "Components/SceneComponent.h"
 #include "Engine/Canvas.h"
+#include "Engine/CanvasRenderTarget2D.h"
+#include "G2FaceLayer.h"
+#include "HeadMountedDisplayFunctionLibrary.h"
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/Texture2D.h"
@@ -14,6 +18,153 @@ namespace
 	const FLinearColor Good(0.35f, 1.f, 0.45f);
 	const FLinearColor Bad(1.f, 0.45f, 0.35f);
 	const FLinearColor Accent(0.35f, 1.f, 0.45f);
+
+	constexpr float LayerDistance = 150.f;    // cm in front of the eyes
+	constexpr int32 PanelW = 1024, PanelH = 320;
+	constexpr float PanelWidthDeg = 34.f;
+	constexpr float PanelPitchDeg = -24.f;    // below the line of sight
+	constexpr double PanelPeriod = 0.1;       // redraw at 10 Hz
+}
+
+AG2SimHUD::AG2SimHUD()
+{
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bTickEvenWhenPaused = true;
+}
+
+void AG2SimHUD::BeginPlay()
+{
+	Super::BeginPlay();
+	if (UHeadMountedDisplayFunctionLibrary::IsHeadMountedDisplayEnabled())
+	{
+		SetupVR();
+	}
+}
+
+void AG2SimHUD::SetupVR()
+{
+	bVR = true;
+	// Face-locked layers use their relative transform as the offset from the eyes.
+	USceneComponent* Root = NewObject<USceneComponent>(this, TEXT("Root"));
+	SetRootComponent(Root);
+	Root->RegisterComponent();
+
+	GlassesLayer = NewObject<UG2FaceLayer>(this, TEXT("GlassesLayer"));
+	GlassesLayer->SetupAttachment(Root);
+	GlassesLayer->SetPriority(10);
+	GlassesLayer->RegisterComponent();
+
+	PanelTarget = Cast<UCanvasRenderTarget2D>(UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(this, UCanvasRenderTarget2D::StaticClass(), PanelW, PanelH));
+	if (PanelTarget)
+	{
+		PanelTarget->ClearColor = FLinearColor(0.015f, 0.02f, 0.015f, 1.f);
+		PanelTarget->OnCanvasRenderTargetUpdate.AddDynamic(this, &AG2SimHUD::DrawPanel);
+		PanelLayer = NewObject<UG2FaceLayer>(this, TEXT("PanelLayer"));
+		PanelLayer->bNoAlphaChannel = true; // an opaque little screen
+		PanelLayer->SetupAttachment(Root);
+		PanelLayer->SetPriority(5);
+		PanelLayer->RegisterComponent();
+		PanelLayer->SetTexture(PanelTarget);
+		PanelLayer->Place(LayerDistance, PanelWidthDeg, PanelPitchDeg, float(PanelW) / PanelH);
+	}
+}
+
+void AG2SimHUD::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	if (!bVR)
+	{
+		return;
+	}
+	AG2SimPlayerController* PC = Cast<AG2SimPlayerController>(GetOwningPlayerController());
+	UG2HubSubsystem* Hub = PC ? PC->GetHub() : nullptr;
+	if (!PC || !Hub)
+	{
+		return;
+	}
+
+	if (GlassesLayer)
+	{
+		const bool bShow = PC->bShowGlasses && Hub->GetFrameCount() > 0;
+		if (bShow && GlassesLayer->GetTexture() != Hub->GetDisplayTexture())
+		{
+			GlassesLayer->SetTexture(Hub->GetDisplayTexture());
+		}
+		GlassesLayer->Place(LayerDistance, PC->VrWidthDeg, PC->VrPitchDeg, 2.f);
+		GlassesLayer->SetVisibility(bShow);
+	}
+
+	// The panel shows when asked for, while the context menu is open, or briefly after an action.
+	const double Now = GetWorld()->GetRealTimeSeconds();
+	const bool bRecent = Now - PC->LastActionTime < 1.5;
+	if (PanelLayer)
+	{
+		PanelLayer->SetVisibility(PC->bHelp || PC->bMenuOpen || bRecent || !Hub->IsConnected());
+	}
+	if (PanelTarget && PanelLayer && PanelLayer->IsVisible() && Now >= NextPanelUpdate)
+	{
+		NextPanelUpdate = Now + PanelPeriod;
+		// Repaint the existing resource: the OpenXR layer caches the texture
+		// RHI, so a recreated resource would leave it showing the old one.
+		PanelTarget->FastUpdateResource();
+		PanelLayer->MarkTextureForUpdate();
+	}
+}
+
+void AG2SimHUD::DrawPanel(UCanvas* InCanvas, int32 Width, int32 Height)
+{
+	AG2SimPlayerController* PC = Cast<AG2SimPlayerController>(GetOwningPlayerController());
+	UG2HubSubsystem* Hub = PC ? PC->GetHub() : nullptr;
+	if (!InCanvas || !PC || !Hub)
+	{
+		return;
+	}
+	UFont* Font = GEngine->GetLargeFont();
+	const float S = 1.4f;
+	const float LineH = 34.f;
+	auto Line = [&](const FString& T, const FLinearColor& Color, float X, float Y)
+	{
+		InCanvas->SetDrawColor(Color.ToFColor(true));
+		InCanvas->DrawText(Font, T, X, Y, S, S);
+	};
+
+	const bool bHub = Hub->IsConnected();
+	const bool bApp = bHub && Hub->IsAppConnected();
+	Line(FString::Printf(TEXT("Source: %s%s"), UG2HubSubsystem::SourceName(PC->Source), PC->bLongPressing ? TEXT("  [long press]") : TEXT("")), Accent, 24, 16);
+	Line(FString::Printf(TEXT("Hub %s   App %s   IMU %s   GPS %s"),
+		bHub ? TEXT("ok") : TEXT("offline"), bApp ? TEXT("running") : TEXT("-"),
+		Hub->IsImuOn() ? TEXT("on") : TEXT("off"), Hub->IsLocationUpdating() ? TEXT("on") : TEXT("off")),
+		bHub && bApp ? Text : Bad, 24, 16 + LineH);
+
+	float Y = 16 + LineH * 2.4f;
+	if (PC->bMenuOpen)
+	{
+		const TArray<FG2MenuItem>& Menu = Hub->GetMenu();
+		for (int32 I = 0; I < Menu.Num() && Y < Height - LineH; ++I, Y += LineH)
+		{
+			const bool bSel = I == PC->MenuIndex;
+			if (bSel)
+			{
+				FCanvasTileItem Tile(FVector2D(16, Y - 2), FVector2D(Width - 32, LineH), FLinearColor(0.15f, 0.5f, 0.2f, 1.f));
+				InCanvas->DrawItem(Tile);
+			}
+			Line(Menu[I].Label, bSel ? Good : Text, 32, Y);
+		}
+	}
+	else if (!bHub)
+	{
+		Line(FString::Printf(TEXT("Waiting for %s"), *Hub->GetUrl()), Bad, 24, Y);
+		Line(TEXT("Run npm run dev and npm run simulate"), Dim, 24, Y + LineH);
+	}
+	else
+	{
+		if (GetWorld()->GetRealTimeSeconds() - PC->LastActionTime < 1.5)
+		{
+			Line(PC->LastAction, Good, 24, Y);
+		}
+		Line(TEXT("Trigger tap  Stick swipe / turn  A double  B hold long"), Dim, 24, Height - LineH * 2.2f);
+		Line(TEXT("Grip menu  X source  Y panel  L-grip+stick display"), Dim, 24, Height - LineH * 1.2f);
+	}
 }
 
 void AG2SimHUD::Panel(float X, float Y, float W, float H)
@@ -26,9 +177,9 @@ void AG2SimHUD::DrawHUD()
 	Super::DrawHUD();
 	AG2SimPlayerController* PC = Cast<AG2SimPlayerController>(GetOwningPlayerController());
 	UG2HubSubsystem* Hub = PC ? PC->GetHub() : nullptr;
-	if (!PC || !Hub || !Canvas)
+	if (!PC || !Hub || !Canvas || bVR)
 	{
-		return;
+		return; // in VR everything is on the stereo layers
 	}
 	if (PC->bShowGlasses)
 	{

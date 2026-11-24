@@ -32,6 +32,26 @@ Another machine or port: `G2Sim.exe -hub=ws://192.168.1.20:5173/__emu/ws`.
 
 Right-temple gestures and list scrolling go through the simulator itself (the firmware scrolls lists); ring and left-temple gestures, long presses and menu clicks are injected by the emulator. See the repo README.
 
+## VR (Meta Quest 2 / 3 over Link)
+
+1. Install the Meta Quest Link app on the PC. In **Settings → General → OpenXR Runtime**, make Meta Quest Link the active runtime (another runtime such as Varjo or SteamVR may be active).
+2. Connect the headset with Link (cable) or Air Link, then start `G2Sim.exe -vr`.
+3. The glasses display is a head-locked layer about 24° wide and slightly above the centre of view. A small info panel below it shows the input source, connection, the context menu and the last action.
+
+| Controller | Action |
+|---|---|
+| Left stick (click: run) | Walk where you look |
+| Right stick left / right | Snap turn 30° |
+| Right stick up / down | Swipe up / down (in the menu: choose) |
+| Right trigger | Tap (in the menu: send) |
+| A / hold B | Double tap / long press |
+| Right grip | Context menu open / close |
+| X | Input source: right temple → ring → left temple |
+| Y | Info panel on / off |
+| Hold left grip + right stick | Display height (up/down) and size (left/right) |
+
+Your real head movement is the IMU stream. The PC window mirrors the left eye, without the compositor layers.
+
 ## Sensors
 
 - **IMU** — while the app has IMU on, the camera's pitch / yaw / roll in degrees are streamed as x / y / z (20 Hz into the emulator, which reports at the app's requested pace). Real-device units and axes are undocumented; this matches the emulator's assumption.
@@ -51,9 +71,11 @@ UnrealEditor.exe <repo>/unreal/G2Sim/G2Sim.uproject -game -windowed -ResX=1600 -
 RunUAT.bat BuildCookRun -project=<repo>/unreal/G2Sim/G2Sim.uproject -platform=Win64 -clientconfig=Shipping -build -cook -stage -pak -iostore -archive -archivedirectory=<repo>/unreal/G2Sim/Packaged -nop4 -unattended
 ```
 
+`package.ps1` does the packaging and the zip in one step: `powershell -ExecutionPolicy Bypass -File unreal/G2Sim/package.ps1`.
+
 Packaging takes ~1 minute once shaders are cached (the first run compiles shaders for much longer). Zip `Packaged/Windows` without the `.pdb` (~220 MB) for a release.
 
-The OpenXR plugin is disabled for now: with it on, the cooker hung on exit on a PC that has the Varjo OpenXR runtime. It comes back with the VR mode.
+With the Varjo OpenXR runtime active, the cooker never exited. `package.ps1` points `XR_RUNTIME_JSON` at no runtime for the build, so packaging works whatever runtime is active.
 
 The scene is built in C++ (`AG2SimGameMode`) on the engine's empty map, so the project has no binary assets yet. Future `.uasset` / `.umap` files are tracked with Git LFS (`.gitattributes`).
 
@@ -62,7 +84,8 @@ The scene is built in C++ (`AG2SimGameMode`) on the engine's empty map, so the p
 | File | Role |
 |---|---|
 | `G2HubSubsystem` | WebSocket client, reconnects every 2 s, PNG → texture, app state, outgoing commands |
-| `G2SimPlayerController` | Polled keyboard / mouse controls, IMU and GPS streaming |
-| `G2SimHUD` | Glasses overlay (with glow), status bar, help, context menu |
+| `G2SimPlayerController` | Polled keyboard / mouse and Touch controller input, IMU and GPS streaming |
+| `G2SimHUD` | Desktop: glasses overlay (with glow), status bar, help, context menu. VR: face-locked layers for the glasses and the info panel |
+| `G2FaceLayer` | Head-locked OpenXR quad layer placed by distance, angular width and pitch |
 | `G2SimGameMode` | Procedural city block, sun / sky / fog, player start |
-| `G2SimCharacter` | First-person walker, camera follows the head roll |
+| `G2SimCharacter` | First-person walker; desktop camera follows mouse look + roll, VR camera follows the headset |

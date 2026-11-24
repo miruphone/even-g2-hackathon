@@ -13,7 +13,11 @@
 	"Plugins": [
 		{
 			"Name": "OpenXR",
-			"Enabled": false
+			"Enabled": true
+		},
+		{
+			"Name": "XRBase",
+			"Enabled": true
 		}
 	]
 }
