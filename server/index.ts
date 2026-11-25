@@ -3,7 +3,7 @@
 // Keys stay here; the glasses app only holds a session token.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { llmStatus } from './classify.ts'
+import { checkLlm, llmStatus } from './classify.ts'
 import { Engine, type ActionId } from './engine.ts'
 import { Telegram } from './telegram.ts'
 
@@ -34,7 +34,7 @@ async function pollLoop() {
       await sleep(5000)
     }
   }
-  console.log(`[bot] @${engine.bot.username} · ${llmStatus()}`)
+  console.log(`[bot] @${engine.bot.username} · ${await checkLlm()}`)
   await tg.call('deleteWebhook', { drop_pending_updates: false }).catch(() => undefined)
   void engine.refreshAllAdmins()
   let offset = 0

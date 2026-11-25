@@ -34,11 +34,11 @@ Community managers and moderators of busy Telegram groups, crypto projects first
 ## How it works
 
 1. **The bot watches.** Add `@<your bot>` to your groups as an admin. It reads new messages, joins and join requests.
-2. **Rules score every message.** Fast, explainable signals: drainer-style links, airdrop and claim bait, seed-phrase requests, "DM me" pitches, look-alike domains, accounts that clone an admin's name, floods, the same text across groups, join spikes, and risky join requests. When the rules are unsure, Claude reviews the message and returns a short verdict.
+2. **Rules score every message.** Fast, explainable signals: drainer-style links, airdrop and claim bait, seed-phrase requests, "DM me" pitches, look-alike domains, accounts that clone an admin's name, floods, the same text across groups, join spikes, and risky join requests. When the rules are unsure, an LLM (OpenAI or Claude) reviews the message and returns a short verdict.
 3. **Related events become one card.** The same account or the same text across three groups is one incident, not three.
 4. **The worst cases are stopped at once.** High-confidence scams and impersonators are muted at once, which can be undone. A human makes the final call.
 5. **You decide in one tap.** The card shows the verdict and the evidence. Swipe through the actions and tap one. Warden mutes the account right away, waits 5 seconds so you can hold to undo, and then bans the account and deletes its messages in every affected group.
-6. **AI writes the follow-up.** "Ban + purge + warn group" posts a short warning that Claude drafts, for example: "Admins never DM first. There is no claim link."
+6. **AI writes the follow-up.** "Ban + purge + warn group" posts a short warning that the LLM drafts, for example: "Admins never DM first. There is no claim link."
 
 ### Glasses controls
 
@@ -71,7 +71,7 @@ The phone page inside the Even app handles pairing, lists your groups and shows 
 ```
 Telegram  ──getUpdates──►  server/ (Node 26, TypeScript)  ◄──HTTPS long poll──  src/ (G2 app in the Even app WebView)
    ▲                         detect.ts   rules + scoring                          app.ts    cards, gestures
-   └──── Bot API actions ─── classify.ts Claude review + warning drafts           api.ts    session token, feed, actions
+   └──── Bot API actions ─── classify.ts LLM review + warning drafts           api.ts    session token, feed, actions
                              engine.ts   incidents, auto-mute, act/undo/commit    phone.ts  phone page
                              index.ts    HTTP API + bot loop
 ```
@@ -101,13 +101,14 @@ Open http://localhost:8081. Copy the pairing code from the glasses into the "DM 
 2. Create `.env`:
    ```
    TELEGRAM_BOT_TOKEN=123456:ABC...
-   ANTHROPIC_API_KEY=sk-ant-...      # optional; without it Warden runs on rules only
+   WARDEN_OPENAI_API_KEY=sk-...      # optional: OpenAI reviews unclear messages and drafts warnings
+   # or ANTHROPIC_API_KEY=sk-ant-... to use Claude instead; with neither, Warden runs on rules only
    ```
 3. `npm run server`, then `npm run dev` and `npm run simulate`.
 4. Add the bot to a group as an admin with "Delete messages" and "Ban users". You must be an admin of that group too.
 5. Send the pairing code shown on the glasses to the bot.
 
-Environment variables for the backend: `PORT` (8787), `TELEGRAM_API_BASE`, `WARDEN_DATA` (data/warden.json), `WARDEN_MODEL` (claude-opus-5-5), `CORS_ORIGINS` (*). For the app: `VITE_WARDEN_API` (the backend URL in production builds).
+Environment variables for the backend: `PORT` (8787), `TELEGRAM_API_BASE`, `WARDEN_DATA` (data/warden.json), `WARDEN_LLM` (openai, claude or none; default: whichever key is set), `OPENAI_MODEL` (gpt-5.4-nano), `WARDEN_MODEL` (claude-opus-5-5), `CORS_ORIGINS` (*). Use `WARDEN_OPENAI_API_KEY` rather than `OPENAI_API_KEY` in `.env`: Node does not let `.env` override a variable that is already set system-wide. For the app: `VITE_WARDEN_API` (the backend URL in production builds).
 
 ## Development tools in this repo
 

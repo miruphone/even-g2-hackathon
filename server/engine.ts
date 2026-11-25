@@ -15,7 +15,7 @@
 import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { draftWarning, review as claudeReview, type ReviewInput, type Verdict } from './classify.ts'
+import { draftWarning, llmName, review as llmReview, type ReviewInput, type Verdict } from './classify.ts'
 import {
   adminHandle,
   analyzeJoin,
@@ -85,7 +85,7 @@ export interface Card {
   resolution?: { action: ActionId; summary: string; at: number }
   attempt?: string // history entries: the action attempt they record
   error?: string
-  ai?: string // verdict source, e.g. "Claude: scam (high)"
+  ai?: string // verdict source, e.g. "OpenAI: scam (high)"
   createdAt: number
   // Phone-only detail (never sent to the glasses UI).
   sample?: string
@@ -293,7 +293,7 @@ export class Engine {
     this.tg = tg
     this.dataFile = dataFile
     this.undoMs = opts.undoMs ?? UNDO_MS
-    this.review = opts.review ?? claudeReview
+    this.review = opts.review ?? llmReview
     this.liftRetryMs = opts.liftRetryMs ?? LIFT_RETRY_MS
     this.load()
   }
@@ -1034,7 +1034,7 @@ export class Engine {
       actions,
       pending: p ? { action: p.action, label: this.actionLabel(i, p.action, p.scope.size), until: p.until, attempt: p.attempt } : undefined,
       error: i.lastError,
-      ai: ev?.verdict ? `Claude: ${ev.verdict.category} (${ev.verdict.confidence})` : undefined,
+      ai: ev?.verdict ? `${llmName()}: ${ev.verdict.category} (${ev.verdict.confidence})` : undefined,
       createdAt: i.createdAt,
       sample: evs.find(e => e.sample)?.sample,
       warning: evs.find(e => e.warning)?.warning,
