@@ -160,6 +160,14 @@ async function reviewClaude(input: ReviewInput): Promise<Verdict | null> {
   return res.parsed_output ?? null
 }
 
+/** Shorten to `max` characters at a word boundary, so a card never shows half a word. */
+export function clip(text: string, max: number): string {
+  const t = text.trim()
+  if (t.length <= max) return t
+  const cut = t.slice(0, max + 1).replace(/\s+\S*$/, '')
+  return (cut.length >= max / 2 ? cut : t.slice(0, max)).replace(/[\s,.;:-]+$/, '')
+}
+
 export async function review(input: ReviewInput, cacheKey?: string): Promise<Verdict | null> {
   const p = pick()
   if (p === 'none') return null
@@ -167,8 +175,8 @@ export async function review(input: ReviewInput, cacheKey?: string): Promise<Ver
   try {
     const v = p === 'openai' ? await reviewOpenAI(input) : await reviewClaude(input)
     if (!v) return null
-    v.label = v.label.slice(0, 28)
-    v.reason = v.reason.slice(0, 60)
+    v.label = clip(v.label, 28)
+    v.reason = clip(v.reason, 60)
     if (cacheKey) verdictCache.set(cacheKey, v)
     if (verdictCache.size > 2000) verdictCache.delete(verdictCache.keys().next().value!)
     return v
