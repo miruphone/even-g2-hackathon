@@ -164,8 +164,9 @@ async function reviewClaude(input: ReviewInput): Promise<Verdict | null> {
 export function clip(text: string, max: number): string {
   const t = text.trim()
   if (t.length <= max) return t
-  const cut = t.slice(0, max + 1).replace(/\s+\S*$/, '')
-  return (cut.length >= max / 2 ? cut : t.slice(0, max)).replace(/[\s,.;:-]+$/, '')
+  const head = t.slice(0, max + 1)
+  const space = head.lastIndexOf(' ')
+  return (space >= max / 2 ? head.slice(0, space) : t.slice(0, max)).replace(/[\s,.;:-]+$/, '')
 }
 
 export async function review(input: ReviewInput, cacheKey?: string): Promise<Verdict | null> {
