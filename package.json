@@ -13,7 +13,9 @@
     "server": "node --env-file-if-exists=.env server/index.ts",
     "tgmock": "node tools/tgmock/server.ts",
     "server:mock": "node --env-file-if-exists=.env --env-file=.env.mock server/index.ts",
-    "test": "node --test server/"
+    "test": "node --test server/",
+    "demo": "node tools/demo/run.ts",
+    "demo:record": "node tools/demo/run.ts --record"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.13.0",

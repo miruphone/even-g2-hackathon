@@ -14,5 +14,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["server", "tools/tgmock"]
+  "include": ["server", "tools/tgmock", "tools/demo"]
 }

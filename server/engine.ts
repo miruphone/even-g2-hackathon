@@ -641,6 +641,8 @@ export class Engine {
     // the unlock still runs: restoring the saved permissions is always safe.
     this.scheduleUnlock(g)
     await this.tg.setChatPermissions(g.id, MUTED)
+    // Members would otherwise just find they cannot type. Best effort: never fail the lock.
+    await this.tg.sendMessage(g.id, 'Chat paused for 10 minutes: a wave of new accounts is joining. Admins are on it.').catch(() => undefined)
   }
 
   private scheduleUnlock(g: Group) {
@@ -656,6 +658,7 @@ export class Engine {
       g.lock = undefined
       this.save()
       this.bump()
+      await this.tg.sendMessage(g.id, 'Chat reopened. Thanks for your patience.').catch(() => undefined)
     } catch (e) {
       console.warn(`[engine] unlock of ${g.title} failed, retrying in 30 s:`, errText(e))
       setTimeout(() => void this.unlockChat(g), 30_000).unref()
@@ -731,6 +734,7 @@ export class Engine {
         this.bump()
       } else if (!g.lock) {
         const inc = this.newIncident('raid', 8, '')
+        inc.severity = 4 // the most urgent card: locking the group also stops the raiders' spam
         inc.raidChat = g.id
         inc.pairs.set(g.id, new Map())
         inc.evidence.set(g.id, { title: `${times.length} joins in 60s`, signals: ['Join spike'] })

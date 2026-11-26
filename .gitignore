@@ -34,3 +34,6 @@ Thumbs.db
 # Warden runtime data
 data/
 !.env.mock
+
+# Demo recordings (tools/demo)
+demo-out/

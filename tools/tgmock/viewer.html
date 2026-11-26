@@ -55,7 +55,9 @@ async function tick() {
   $('chats').innerHTML = s.chats.map(c => `
     <section class="chat">
       <h2><span>${esc(c.title)}</span>${c.locked ? '<span class="locked">🔒 locked</span>' : ''}</h2>
-      <div class="msgs">${c.messages.map(m => m.text === '→ joined'
+      <div class="msgs">${c.messages.map(m => m.service && m.text !== '→ joined'
+        ? `<div class="m sys">${esc(m.service)}</div>`
+        : m.text === '→ joined'
         ? `<div class="m sys">${esc(m.from)} joined</div>`
         : `<div class="m ${m.bot ? 'bot' : ''} ${m.deleted ? 'del' : ''}"><b>${esc(m.from)}</b>${esc(m.text)}</div>`).join('')}</div>
       <div class="members">${c.members.map(m => `<span class="tag ${m.status}">${esc(m.name)} · ${m.status}</span>`).join('')}

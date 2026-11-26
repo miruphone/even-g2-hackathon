@@ -24,7 +24,7 @@ interface Member {
 interface MockChat {
   chat: TgChat
   members: Map<number, Member>
-  messages: (TgMessage & { deleted?: boolean })[]
+  messages: (TgMessage & { deleted?: boolean; deletedAt?: number; service?: string })[]
   permissions: Record<string, boolean>
   joinRequests: { user: TgUser; bio?: string; state: 'pending' | 'approved' | 'declined' }[]
 }
@@ -42,6 +42,8 @@ let messageId = 100
 let nextUserId = 5000
 let waiters: (() => void)[] = []
 const log: string[] = []
+// What the demo overlay shows next to the glasses (set by tools/demo).
+const stage: { caption: string; sub: string; mode: 'groups' | 'dm'; gesture?: { name: string; at: number }; title: string } = { caption: '', sub: '', mode: 'groups', title: '' }
 
 function note(s: string) {
   log.push(`${new Date().toISOString().slice(11, 19)} ${s}`)
@@ -284,6 +286,7 @@ async function api(method: string, p: Record<string, unknown>): Promise<unknown>
       for (const m of c.messages) {
         if (ids.has(m.message_id) && !m.deleted) {
           m.deleted = true
+          m.deletedAt = Date.now()
           n++
         }
       }
@@ -296,7 +299,9 @@ async function api(method: string, p: Record<string, unknown>): Promise<unknown>
       const user = m?.user ?? users.get(userId)
       if (!user) throw new ApiError(400, 'Bad Request: user not found')
       c.members.set(userId, { user, status: 'kicked' })
-      if (p.revoke_messages) for (const msg of c.messages) if (msg.from?.id === userId) msg.deleted = true
+      if (p.revoke_messages) for (const msg of c.messages) if (msg.from?.id === userId && !msg.deleted) Object.assign(msg, { deleted: true, deletedAt: Date.now() })
+      // Telegram shows a service line when an admin removes someone.
+      c.messages.push({ message_id: messageId++, chat: c.chat, date: Math.floor(Date.now() / 1000), service: `${BOT.first_name} removed ${[user.first_name, user.last_name].filter(Boolean).join(' ')}` })
       note(`banned ${user.first_name} in ${c.chat.title}`)
       return true
     }
@@ -368,16 +373,24 @@ function state() {
       locked: !c.permissions.can_send_messages,
       members: [...c.members.values()].filter(m => m.status !== 'member' || m.user.id >= 5000).map(m => ({ name: [m.user.first_name, m.user.last_name].filter(Boolean).join(' '), username: m.user.username, status: m.status })),
       joinRequests: c.joinRequests.map(j => ({ name: [j.user.first_name, j.user.last_name].filter(Boolean).join(' '), state: j.state })),
+      memberCount: [...c.members.values()].filter(m => m.status !== 'kicked' && m.status !== 'left').length + 1200 + Math.abs(c.chat.id % 7) * 311,
       messages: c.messages.slice(-40).map(m => ({
         id: m.message_id,
         from: m.from ? [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') : '',
+        uid: m.from?.id ?? 0,
         bot: m.from?.id === BOT.id,
+        admin: m.from ? ['creator', 'administrator'].includes(c.members.get(m.from.id)?.status ?? '') && m.from.id !== BOT.id : false,
         text: m.text ?? (m.new_chat_members ? '→ joined' : ''),
+        service: m.service ?? (m.new_chat_members ? `${[m.from?.first_name, m.from?.last_name].filter(Boolean).join(' ')} joined the group` : undefined),
+        date: m.date,
         deleted: !!m.deleted,
+        deletedAt: m.deletedAt,
       })),
     })),
     dms: dms.slice(-8),
     log: log.slice(-30),
+    stage,
+    bot: BOT,
   }
 }
 
@@ -410,6 +423,19 @@ createServer(async (req, res) => {
       if (!s) return json(res, 404, { error: 'unknown scenario' })
       note(`▶ scenario: ${s.title}`)
       void s.run()
+      return json(res, 200, { ok: true })
+    }
+    if (url.pathname === '/stage') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      return res.end(readFileSync(new URL('./stage.html', import.meta.url)))
+    }
+    if (req.method === 'POST' && url.pathname === '/mock/stage') {
+      const b = await body(req)
+      if (typeof b.caption === 'string') stage.caption = b.caption
+      if (typeof b.sub === 'string') stage.sub = b.sub
+      if (typeof b.title === 'string') stage.title = b.title
+      if (b.mode === 'groups' || b.mode === 'dm') stage.mode = b.mode
+      if (typeof b.gesture === 'string') stage.gesture = { name: b.gesture, at: Date.now() }
       return json(res, 200, { ok: true })
     }
     if (req.method === 'POST' && url.pathname === '/mock/dm') {
