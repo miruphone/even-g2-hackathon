@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Warden</title>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="45%" r="70%">
+      <stop offset="0" stop-color="#11241a"/>
+      <stop offset="1" stop-color="#050907"/>
+    </radialGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="14" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.2  0 0 0 0 1  0 0 0 0 0.5  0 0 0 0.55 0" result="g"/>
+      <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <g filter="url(#glow)" fill="none" stroke="#3dff8a" stroke-linecap="round" stroke-linejoin="round">
+    <!-- shield: the guard -->
+    <path d="M512 150 L782 248 V512 C782 694 664 808 512 878 C360 808 242 694 242 512 V248 Z" stroke-width="36" fill="#3dff8a" fill-opacity="0.05"/>
+    <!-- G2-style round glasses: eyes up -->
+    <circle cx="418" cy="470" r="80" stroke-width="28"/>
+    <circle cx="606" cy="470" r="80" stroke-width="28"/>
+    <path d="M498 462 Q512 440 526 462" stroke-width="22"/>
+    <path d="M338 452 L292 432" stroke-width="22"/>
+    <path d="M686 452 L732 432" stroke-width="22"/>
+    <!-- the HUD's severity blocks ■■■□ -->
+    <g stroke-width="10">
+      <rect x="402" y="626" width="40" height="40" rx="4" fill="#3dff8a"/>
+      <rect x="458" y="626" width="40" height="40" rx="4" fill="#3dff8a"/>
+      <rect x="514" y="626" width="40" height="40" rx="4" fill="#3dff8a"/>
+      <rect x="570" y="626" width="40" height="40" rx="4"/>
+    </g>
+  </g>
+</svg>

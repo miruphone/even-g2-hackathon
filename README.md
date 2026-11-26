@@ -1,3 +1,5 @@
+<img src="assets/logo.png" alt="Warden logo" width="120" align="right">
+
 # Warden: guard your Telegram groups without reading them
 
 Warden is an Even Realities G2 app for people who run Telegram communities. A bot sits in your groups as an admin. When a scam account shows up, your glasses show one verdict card, never the message itself. You pick an action with the ring and tap once.
