@@ -3,17 +3,19 @@
 Warden is an Even Realities G2 app for people who run Telegram communities. A bot sits in your groups as an admin. When a scam account shows up, your glasses show one verdict card, never the message itself. You pick an action with the ring and tap once.
 
 ```
-■■■■ SCAM   1/2                        auto-muted
+■■■■ SCAM                    auto-muted · +1 waiting
 ┌──────────────────────────────────────────────┐
-│ Wallet-drainer link                          │
+│ Fake TON airdrop claim link                  │
 │ @ton_rewards_drop · 3 groups · 3 msgs        │
-│ Airdrop / claim bait · Joined 1m ago         │
+│ AI ● Airdrop bait with a wallet-connect link │
 └──────────────────────────────────────────────┘
- ▶ Ban + purge (3 groups)          ← tap
-   Ban + purge + warn group
-   Mute 24h
-   Not spam - trust
+ [Ban + purge (3 groups)]          ← swipe picks, tap runs
+  Ban + purge + warn (3 groups)
+  Mute 24h + delete (3 groups)
+  Not spam: trust user
 ```
+
+After the tap, the same card stays up for 5 seconds (`▶ Banning @ton_rewards_drop in 3 groups · Hold to undo ■■■□□`, plus the exact warning it will post), then a result screen shows what Telegram confirmed: `Banned in 3 groups · 3 msgs removed · live 11s · warning posted`.
 
 **Track:** 01 Messaging & News (Telegram). Also entered for Best Telegram integration.
 
@@ -37,8 +39,9 @@ Community managers and moderators of busy Telegram groups, crypto projects first
 2. **Rules score every message.** Fast, explainable signals: drainer-style links, airdrop and claim bait, seed-phrase requests, "DM me" pitches, look-alike domains, accounts that clone an admin's name, floods, the same text across groups, join spikes, and risky join requests. When the rules are unsure, an LLM (OpenAI or Claude) reviews the message and returns a short verdict.
 3. **Related events become one card.** The same account or the same text across three groups is one incident, not three.
 4. **The worst cases are stopped at once.** High-confidence scams and impersonators are muted at once, which can be undone. A human makes the final call.
-5. **You decide in one tap.** The card shows the verdict and the evidence. Swipe through the actions and tap one. Warden mutes the account right away, waits 5 seconds so you can hold to undo, and then bans the account and deletes its messages in every affected group.
-6. **AI writes the follow-up.** "Ban + purge + warn group" posts a short warning that the LLM drafts, for example: "Admins never DM first. There is no claim link."
+5. **You decide in one tap.** The card shows the verdict, who and where, and one reason (the AI's, or the strongest rule). Swipe through the actions and tap one. Warden mutes the account right away, keeps the card on screen for 5 seconds so you can hold to undo, and then bans the account and deletes its messages in every affected group. The result says how long the scam stayed visible.
+6. **AI writes the follow-up, and you see it first.** "Ban + purge + warn" posts a short warning drafted in advance by the LLM and shown on the glasses during the undo window. Drafts with links, handles or markdown fall back to a template.
+7. **The AI is a second opinion, not a hair trigger.** When the rules mute someone who was only warning others about a scam (quoting its link), the AI reads the intent, lifts the mute and turns the card into LIKELY OK with "Not spam: trust user" first.
 
 ### Glasses controls
 
@@ -48,9 +51,15 @@ Community managers and moderators of busy Telegram groups, crypto projects first
 | Tap | run the action | open recent actions | back |
 | Hold | undo the last action (5 s window) | undo | undo |
 | Double tap | exit | exit | exit |
-| Context menu | undo, auto-mute on/off, recent, unpair | | |
+| Context menu | undo, auto-mute on/off, recent, unpair (asks to confirm) | | |
 
-The phone page inside the Even app handles pairing, lists your groups and shows each incident in detail when you want to read it later.
+The phone page inside the Even app handles pairing, lists your groups with any missing bot rights and how to fix them, and keeps the record: each incident with its message (phone only), the AI's reason, the warning that would be or was posted, and the outcome.
+
+### In Telegram
+
+- Pair by sending the 6-digit code from the glasses to the bot (the phone's "Open Telegram and pair" link does it for you).
+- When you add, promote or remove the bot, it DMs you what it can do in that group, or exactly which right is missing and where to turn it on. `/status` repeats this any time. An "Add Warden to a group" button opens Telegram's group picker with Delete messages, Ban users and Invite users pre-selected.
+- Groups stay quiet: the only posts are the warning you chose to send and a one-line notice when a raid lock pauses and reopens the chat.
 
 ### Built for the G2 platform limits
 
@@ -62,7 +71,7 @@ The phone page inside the Even app handles pairing, lists your groups and shows 
 
 - The glasses never show message text, only Warden's verdict. Message text stays on the backend in memory and is shown only on the admin's phone.
 - Actions run only in groups where the paired Telegram account is an admin, and the server checks this on every action.
-- Each destructive action starts with a mute that can be undone and gives a 5-second undo window. "Not spam - trust" lifts the auto-mute and whitelists the user in that group.
+- Each destructive action starts with a mute that can be undone and gives a 5-second undo window. "Not spam: trust user" lifts the auto-mute and whitelists the user in that group.
 - The classifier treats message text as untrusted data, so injected instructions are only evidence. It is told to be conservative about normal crypto conversation.
 - No funds and no trading are involved.
 
@@ -93,7 +102,9 @@ npm run dev           # glasses app on :5173 (proxies /api to :8787)
 npm run simulate      # Even Hub simulator
 ```
 
-Open http://localhost:8081. Copy the pairing code from the glasses into the "DM bot as admin" box, then press the scenario buttons: drainer bot, fake admin, raid, join requests.
+Open http://localhost:8081. Copy the pairing code from the glasses into the "DM bot as admin" box, then press the scenario buttons: drainer bot, fake admin, a member warning about the drainer, raid, join requests.
+
+To play the whole demo hands-free (scenarios, ring gestures and captions on the `/stage` overlay): `npm run demo`. `npm run demo:record` also records it with OBS Studio, composing the G2Sim window and the overlay offscreen (`tools/demo/obs.ts`).
 
 ### With a real bot
 
@@ -112,7 +123,8 @@ Environment variables for the backend: `PORT` (8787), `TELEGRAM_API_BASE`, `WARD
 
 ## Development tools in this repo
 
-- `tools/tgmock/`: a mock Telegram Bot API with scripted attacks and a live viewer.
+- `tools/tgmock/`: a mock Telegram Bot API with scripted attacks, a live viewer, and a `/stage` overlay (simulated Telegram, captions) for recording.
+- `tools/demo/`: the scripted demo take and the OBS recording controller.
 - `src/dev/emulator.ts` + `tools/emulator/`: hardware emulator for the desktop simulator (ring, left temple, long press, context menu, IMU, location), with a control panel at `/__emu` and a WebSocket hub at `/__emu/ws`. Scriptable: `curl -X POST localhost:5173/__emu/send -d '{"type":"input","source":"ring","gesture":"tap"}'`.
 - `unreal/G2Sim/`: an Unreal Engine 5.8 desktop and Quest simulator that shows the live glasses display over a 3D first-person view. See [unreal/G2Sim/README.md](unreal/G2Sim/README.md).
 
