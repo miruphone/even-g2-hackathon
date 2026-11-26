@@ -5,7 +5,8 @@
 //   node tools/tgmock/server.ts            (port 8081)
 //   TELEGRAM_BOT_TOKEN=mock TELEGRAM_API_BASE=http://localhost:8081 node server/index.ts
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { TgChat, TgChatMember, TgMessage, TgUpdate, TgUser } from '../../server/telegram.ts'
 
@@ -43,7 +44,9 @@ let nextUserId = 5000
 let waiters: (() => void)[] = []
 const log: string[] = []
 // What the demo overlay shows next to the glasses (set by tools/demo).
-const stage: { caption: string; sub: string; mode: 'groups' | 'dm'; gesture?: { name: string; at: number }; title: string } = { caption: '', sub: '', mode: 'groups', title: '' }
+const stage: { caption: string; sub: string; mode: 'groups' | 'dm'; gesture?: { name: string; at: number }; voice?: { id: string; at: number }; title: string } = { caption: '', sub: '', mode: 'groups', title: '' }
+const VOICE_DIR = resolve(process.env.DEMO_OUT ?? 'demo-out', 'voice')
+let stageSeenAt = 0 // last poll from the /stage overlay (so a recorder can wait for it to load)
 
 function note(s: string) {
   log.push(`${new Date().toISOString().slice(11, 19)} ${s}`)
@@ -417,13 +420,23 @@ createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       return res.end(readFileSync(viewer))
     }
-    if (url.pathname === '/mock/state') return json(res, 200, state())
+    if (url.pathname === '/mock/state') {
+      if (url.searchParams.get('from') === 'stage') stageSeenAt = Date.now()
+      return json(res, 200, state())
+    }
+    if (url.pathname === '/mock/stage-seen') return json(res, 200, { at: stageSeenAt, now: Date.now() })
+    if (url.pathname === '/mock/voices') return json(res, 200, existsSync(VOICE_DIR) ? readdirSync(VOICE_DIR).filter(f => f.endsWith('.wav')).map(f => f.slice(0, -4)) : [])
     if (req.method === 'POST' && url.pathname.startsWith('/mock/scenario/')) {
       const s = SCENARIOS[url.pathname.split('/').pop() ?? '']
       if (!s) return json(res, 404, { error: 'unknown scenario' })
       note(`▶ scenario: ${s.title}`)
       void s.run()
       return json(res, 200, { ok: true })
+    }
+    const clip = url.pathname.match(/^\/voice\/(\w+)\.wav$/)
+    if (clip && existsSync(resolve(VOICE_DIR, `${clip[1]}.wav`))) {
+      res.writeHead(200, { 'content-type': 'audio/wav', 'cache-control': 'no-store' })
+      return res.end(readFileSync(resolve(VOICE_DIR, `${clip[1]}.wav`)))
     }
     if (url.pathname === '/stage') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -436,6 +449,7 @@ createServer(async (req, res) => {
       if (typeof b.title === 'string') stage.title = b.title
       if (b.mode === 'groups' || b.mode === 'dm') stage.mode = b.mode
       if (typeof b.gesture === 'string') stage.gesture = { name: b.gesture, at: Date.now() }
+      if (typeof b.voice === 'string') stage.voice = { id: b.voice, at: Date.now() }
       return json(res, 200, { ok: true })
     }
     if (req.method === 'POST' && url.pathname === '/mock/dm') {

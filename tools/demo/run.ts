@@ -6,10 +6,11 @@
 //   node tools/demo/run.ts --record   also start/stop an OBS recording (tools/demo/obs.ts)
 //
 // It drives tgmock scenarios and captions (/mock/stage, shown by tgmock's /stage
-// overlay), ring gestures (simulator API for list swipes, the Vite emulator for
+// overlay) with Gemini TTS narration (tools/demo/voice.ts), ring gestures (simulator API for list swipes, the Vite emulator for
 // taps and holds), and waits on the Warden API between beats.
 
 import { readFileSync } from 'node:fs'
+import { clipMs, ensureVoices, LINES, type Line, type LineId } from './voice.ts'
 
 const MOCK = process.env.TGMOCK ?? 'http://localhost:8081'
 const SIM = process.env.SIM_API ?? 'http://localhost:9898'
@@ -27,10 +28,13 @@ async function post(url: string, body: unknown = {}) {
   if (!res.ok) throw new Error(`${url}: ${res.status}`)
 }
 
-const stage = (s: { caption?: string; sub?: string; mode?: 'groups' | 'dm'; title?: string; gesture?: string }) => post(`${MOCK}/mock/stage`, s)
-const caption = (c: string, sub = '') => {
-  console.log(`${stamp()}  ${c}`)
-  return stage({ caption: c, sub })
+const stage = (s: { caption?: string; sub?: string; mode?: 'groups' | 'dm'; title?: string; gesture?: string; voice?: string }) => post(`${MOCK}/mock/stage`, s)
+/** Show a line's caption and speak it; resolves when the narration ends. */
+async function say(id: LineId) {
+  const l: Line = LINES[id]
+  console.log(`${stamp()}  [${id}] ${l.say}`)
+  await stage({ caption: l.caption, sub: l.sub ?? '', voice: id })
+  await sleep(clipMs(id) + 350)
 }
 const scenario = (name: string) => post(`${MOCK}/mock/scenario/${name}`)
 
@@ -40,7 +44,14 @@ const ring = {
     await stage({ gesture: 'Ring: swipe down' })
     await post(`${SIM}/api/input`, { action: 'down' })
   },
+  /** Taps only count on a card (an action list); the undo and result screens ignore them. */
   async tap(index = 0) {
+    for (let i = 0; i < 60; i++) {
+      const st = (await (await fetch(`${VITE}/__emu/state`)).json()) as { app?: { capture?: { kind: string; name: string } } }
+      if (st.app?.capture?.kind === 'list' && st.app.capture.name === 'actions') break
+      await sleep(150)
+    }
+    await sleep(400) // let the card settle on screen before the finger lands
     await stage({ gesture: 'Ring: tap' })
     await post(`${VITE}/__emu/send`, { type: 'input', gesture: 'tap', source: 'ring', index })
   },
@@ -79,130 +90,131 @@ async function until<T>(what: string, check: (f: Feed) => T | undefined | false,
   }
 }
 
-const openCard = (pred: (c: Card) => boolean) => (f: Feed) => f.queue.find(c => c.status === 'open' && pred(c))
 /** The card the glasses show is the first open one in the queue. */
 const shown = (pred: (c: Card) => boolean) => (f: Feed) => {
   const c = f.queue.find(x => x.status === 'open')
   return c && pred(c) ? c : undefined
 }
-const resolvedSince = (n: number) => (f: Feed) => f.recent.length > n && f.recent[0]
 
 // ------------------------------------------------------------------ the take
 
 async function main() {
+  await ensureVoices()
   const f0 = await feed()
   if (!f0.paired) throw new Error('The simulator is not paired yet.')
   if (f0.queue.some(c => c.status === 'open')) throw new Error('Open cards left from an earlier run: restart the mock stack first.')
   let done = f0.recent.length
+  const result = (what: string) => until(what, f => f.recent.length > done && f.recent[0], 20_000).then(r => (done++, r))
 
+  await stage({ mode: 'groups', caption: '', sub: '', title: '' })
   if (RECORD) await (await import('./obs.ts')).startRecording()
-  await stage({ mode: 'groups', caption: '', sub: '', title: 'Warden|Telegram moderation on Even G2: eyes up, hands free|Heads Up hackathon · Track 01 Messaging (Telegram)' })
-  await sleep(6000)
+  await sleep(2000) // establishing shot: the world and the quiet glasses
+  await stage({ title: 'Warden|Telegram moderation on Even G2: eyes up, hands free|Heads Up hackathon · Track 01 Messaging (Telegram)' })
+  await sleep(1500)
+  await say('intro')
   await stage({ title: '' })
   await scenario('chatter')
-  await caption('Miru runs three crypto Telegram groups. Right now she is walking to a meetup.', 'Warden watches the groups for her. The glasses stay quiet until something needs her.')
-  await sleep(9000)
+  await say('miru')
 
   // 1. Drainer in three groups ------------------------------------------------
   await scenario('drainer')
-  await caption('A drainer bot posts the same fake airdrop in all three groups.')
+  await say('drainer1')
   await until('the drainer card', shown(c => c.kind === 'scam'))
-  await caption('Warden mutes it everywhere at once and shows her only the verdict, never the message.', 'Rules flag it in milliseconds. OpenAI confirms and writes the one-line reason.')
-  await until('the AI verdict', openCard(c => c.kind === 'scam' && !!c.ai), 10_000).catch(() => undefined)
-  await sleep(5500)
-  await caption('One swipe picks "Ban + purge + warn". One tap does it.')
+  const verdict = say('drainer2')
+  await until('the AI verdict', shown(c => c.kind === 'scam' && !!c.ai), 12_000).catch(() => undefined)
+  await verdict
+  const pick = say('drainer3')
+  await sleep(1400)
   await ring.down()
-  await sleep(1500)
+  await pick
   await ring.tap(1)
-  await sleep(1200)
-  await caption('For 5 seconds she can still undo. She sees the warning Warden wrote before it is posted.')
-  await until('the ban result', resolvedSince(done), 20_000)
-  done++
-  await caption('Gone from all three groups, and the warning is posted.', 'The result says how long the scam stayed visible.')
-  await sleep(5000)
+  await say('drainer4') // spoken during the undo window
+  await result('the ban result')
+  await say('drainer5')
+  await sleep(800)
 
   // 2. Impersonator, with undo -------------------------------------------------
   await scenario('impersonator')
-  await caption('Next: a new account copying Miru\'s name offers "support" by DM.')
+  await say('imp1')
   await until('the impersonator card', shown(c => c.kind === 'impersonation'))
-  await sleep(4500)
+  await sleep(2000)
   await ring.tap(0)
-  await sleep(1800)
-  await caption('Tapped too fast? Hold the ring to undo.')
-  await ring.hold()
-  await sleep(2600)
-  await caption('Undone. Nothing reached Telegram and the card is back.', 'Mutes Warden applied are lifted again; only the admin who acted can undo.')
-  await sleep(3500)
+  await say('imp2')
+  await ring.hold() // well inside the 5 s window
+  await sleep(900)
+  await say('imp3')
+  await sleep(600)
+  const again = say('imp4')
   await ring.tap(0)
-  await caption('This time she lets it go through.')
-  await until('the impersonator ban', resolvedSince(done), 20_000)
-  done++
-  await sleep(4000)
+  await again
+  await result('the impersonator ban')
+  await sleep(1500)
 
   // 3. AI clears a false alarm ------------------------------------------------
   await scenario('warner')
-  await caption('A newcomer warns everyone about the drainer, quoting its link.')
+  await say('warn1')
   await until('the warner card', shown(c => c.kind === 'scam'))
-  await caption('The rules see a fresh account posting a claim link and mute him.', 'Then the AI reads the intent: a warning, not a scam. It lifts the mute.')
+  const ai = say('warn2')
   await until('the AI clearing it', shown(c => !!c.likelyOk), 15_000)
-  await sleep(4500)
-  await caption('LIKELY OK. One tap trusts him.', 'Rules are fast; the AI is a second opinion, not a hair trigger.')
+  await ai
+  const trust = say('warn3')
+  await sleep(2200)
   await ring.tap(0)
-  await until('the trust result', resolvedSince(done), 20_000)
-  done++
-  await sleep(3500)
+  await trust
+  await result('the trust result')
+  await sleep(1200)
 
   // 4. Raid --------------------------------------------------------------------
   await scenario('raid')
-  await caption('A raid: ten bot accounts join one group within seconds.')
+  await say('raid1')
   await until('the raid card', shown(c => c.kind === 'raid'))
-  await sleep(3000)
-  await caption('Lock the group for 10 minutes. Members are told why, and it reopens by itself.')
+  const lock = say('raid2')
+  await sleep(1800)
   await ring.tap(0)
-  await until('the lock', resolvedSince(done), 20_000)
-  done++
-  await sleep(3500)
+  await lock
+  await result('the lock')
   const spam = await until('the raid spam card', shown(c => c.kind === 'spam'), 8000).catch(() => undefined)
   if (spam) {
-    await caption('Their spam is one card: four accounts, one tap.')
-    await sleep(3000)
+    const one = say('raid3')
+    await sleep(1800)
     await ring.tap(0)
-    await until('the spam ban', resolvedSince(done), 20_000)
-    done++
-    await sleep(3500)
+    await one
+    await result('the spam ban')
   }
+  await sleep(1500)
 
   // 5. Join requests -------------------------------------------------------------
   await scenario('joinreq')
-  await caption('Join requests arrive with a smart default.', 'A "wallet recovery" profile: Decline is first. A builder: Approve is first.')
+  const joins = say('join1')
   await until('the risky join request', shown(c => c.kind === 'join' && c.actions[0]?.id === 'decline'))
-  await sleep(4000)
+  await sleep(2000)
   await ring.tap(0)
-  await until('the first decision', resolvedSince(done), 20_000)
-  done++
-  await sleep(3500)
+  await result('the first decision')
+  await joins
   await until('the second join request', shown(c => c.kind === 'join' && c.actions[0]?.id === 'approve'), 8000)
-  await sleep(2500)
   await ring.tap(0)
-  await until('the second decision', resolvedSince(done), 20_000)
-  done++
-  await sleep(3000)
+  await say('join2')
+  await result('the second decision')
+  await sleep(1200)
 
   // 6. Telegram-side setup ---------------------------------------------------------
   await stage({ mode: 'dm' })
-  await caption('Setup lives in Telegram: send the 6-digit code from the glasses, add the bot with one button.', 'The bot tells her what it can do in each group, and /status checks it any time.')
+  const setupLine = say('setup')
   await sleep(1500)
   await post(`${MOCK}/mock/dm`, { text: '/status' })
-  await sleep(7000)
+  await setupLine
+  await sleep(1200)
   await stage({ mode: 'groups' })
 
   // 7. Close ------------------------------------------------------------------------
-  await caption('Message text never reaches the glasses. Every action can be undone for 5 seconds.', 'Admin rights are checked with Telegram before every action and again when it commits.')
-  await sleep(8000)
-  await stage({ caption: '', sub: '', title: 'Warden|github.com/miruphone/even-g2-hackathon|Even Hub SDK · Telegram Bot API · OpenAI' })
-  await sleep(6000)
+  await say('close')
+  await sleep(400)
+  await stage({ caption: '', sub: '', title: 'Warden|github.com/miruphone/even-g2-hackathon|Even Hub SDK · Telegram Bot API · OpenAI · narration: Gemini TTS' })
+  await say('outro')
+  await sleep(2200)
   if (RECORD) await (await import('./obs.ts')).stopRecording()
   console.log(`${stamp()}  done`)
+  process.exit(0) // the OBS connection would keep the process alive
 }
 
 main().catch(async e => {

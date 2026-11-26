@@ -9,7 +9,7 @@
 
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const OBS_DIR = process.env.OBS_DIR ?? 'C:/Program Files/obs-studio/bin/64bit'
@@ -64,6 +64,26 @@ function b64sha(s: string): string {
 }
 
 let obs: Obs | null = null
+let child: ReturnType<typeof spawn> | null = null
+
+// OBS ignores --websocket_port while the server is switched off in its settings,
+// so switch it on for this run and put the setting back afterwards.
+const WS_CONFIG = `${process.env.APPDATA}/obs-studio/plugin_config/obs-websocket/config.json`
+let restoreWs: string | null = null
+
+function enableWebsocket() {
+  if (!existsSync(WS_CONFIG)) return
+  const raw = readFileSync(WS_CONFIG, 'utf8')
+  const cfg = JSON.parse(raw) as { server_enabled?: boolean }
+  if (cfg.server_enabled) return
+  restoreWs = raw
+  writeFileSync(WS_CONFIG, JSON.stringify({ ...cfg, server_enabled: true }, null, 2))
+}
+
+function restoreWebsocket() {
+  if (restoreWs !== null) writeFileSync(WS_CONFIG, restoreWs)
+  restoreWs = null
+}
 
 /** Start a private OBS instance and connect to it. */
 async function launch(): Promise<Obs> {
@@ -71,7 +91,9 @@ async function launch(): Promise<Obs> {
   const password = randomBytes(12).toString('hex')
   const exe = `${OBS_DIR}/obs64.exe`
   if (!existsSync(exe)) throw new Error(`OBS not found at ${exe} (set OBS_DIR)`)
-  const child = spawn(exe, ['--multi', '--minimize-to-tray', '--disable-shutdown-check', '--websocket_port', String(PORT), '--websocket_password', password], { cwd: OBS_DIR, detached: true, stdio: 'ignore' })
+  enableWebsocket()
+  process.on('exit', restoreWebsocket)
+  child = spawn(exe, ['--multi', '--minimize-to-tray', '--disable-shutdown-check', '--websocket_port', String(PORT), '--websocket_password', password], { cwd: OBS_DIR, detached: true, stdio: 'ignore' })
   child.unref()
   const o = new Obs()
   for (let i = 0; ; i++) {
@@ -80,6 +102,16 @@ async function launch(): Promise<Obs> {
       break
     } catch (e) {
       if (i > 40) throw e
+      await sleep(500)
+    }
+  }
+  // The socket opens before OBS has loaded its scenes ("not ready", 207).
+  for (let i = 0; ; i++) {
+    try {
+      await o.call('GetSceneCollectionList')
+      break
+    } catch (e) {
+      if (i > 60) throw e
       await sleep(500)
     }
   }
@@ -147,10 +179,23 @@ export async function screenshot(file: string) {
   return resolve(file)
 }
 
+/** Wait until the overlay page (inside OBS) is polling tgmock again after its refresh. */
+async function overlayReady(since: number) {
+  const base = new URL(STAGE_URL).origin
+  for (let i = 0; i < 60; i++) {
+    const r = (await (await fetch(`${base}/mock/stage-seen`)).json()) as { at: number }
+    if (r.at > since + 1500) return
+    await sleep(250)
+  }
+  throw new Error('the overlay did not load in OBS')
+}
+
 export async function startRecording() {
   const o = await launch()
+  const t = Date.now()
   await setup(o)
-  await sleep(2000) // let the browser source load
+  await overlayReady(t)
+  await sleep(1500) // clips preloaded
   await o.call('StartRecord')
   console.log('[obs] recording')
   await sleep(500)
@@ -160,11 +205,18 @@ export async function stopRecording(): Promise<string | undefined> {
   if (!obs) return undefined
   const r = await obs.call<{ outputPath?: string }>('StopRecord', {}, true)
   console.log(`[obs] saved ${r.outputPath ?? '(no output)'}`)
+  await sleep(1500) // let OBS finish the file
+  await quit()
   return r.outputPath
 }
 
+/** Close our OBS instance and restore the websocket setting. */
 export async function quit() {
   obs?.close()
+  obs = null
+  child?.kill()
+  child = null
+  restoreWebsocket()
 }
 
 if (process.argv[1]?.endsWith('obs.ts') && process.argv[2] === 'check') {
