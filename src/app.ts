@@ -132,7 +132,7 @@ export async function startApp(bridge: EvenAppBridge) {
 
   function idleBody(f: Feed): string {
     const lines = ['', '            All quiet', '']
-    lines.push(`   ${f.stats.scanned.toLocaleString('en-US')} messages checked in ${f.groups.length} group${f.groups.length === 1 ? '' : 's'}`)
+    lines.push(`   ${f.stats.scanned.toLocaleString('en-US')} message${f.stats.scanned === 1 ? '' : 's'} checked in ${f.groups.length} group${f.groups.length === 1 ? '' : 's'}`)
     lines.push(`   Handled ${f.stats.handled} · auto-mute ${f.autoMute ? 'ON' : 'OFF'}`)
     const last = f.recent[0]
     if (last?.resolution) lines.push('', `   Last: ${last.resolution.summary.slice(0, 38)} (${ago(last.resolution.at)})`)
