@@ -35,6 +35,9 @@
       .sev4 b, .sev3 b { color: #ffb4a8; }
       .ok { color: #9ae6a0; } .bad { color: #ffb4a8; } .dim { color: #8a8a8a; }
       small { color: #8a8a8a; }
+      .tag { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: #8a8a8a; margin-bottom: 2px; }
+      body[data-paired="no"] .after-pair { display: none; }
+      details summary { cursor: pointer; color: #8a8a8a; font-size: 12px; }
     </style>
   </head>
   <body>
@@ -42,10 +45,10 @@
       <header><h1>Warden</h1><span>Telegram group guard for G2</span></header>
       <div class="card"><div id="status">Starting…</div></div>
       <div class="card" id="pair" hidden></div>
-      <div class="card"><div class="label">Needs a decision</div><ul id="queue"></ul></div>
-      <div class="card"><div class="label">Done</div><ul id="recent"></ul></div>
-      <div class="card"><div class="label">Groups</div><ul id="groups"></ul></div>
-      <div class="card"><div class="label">Log</div><ul id="log" style="font: 11px/1.5 ui-monospace, monospace; color:#9a9a9a; max-height: 160px; overflow-y: auto"></ul></div>
+      <div class="card after-pair" id="groupsCard"><div class="label">Groups</div><ul id="groups"></ul></div>
+      <div class="card after-pair"><div class="label">Needs a decision (on your glasses)</div><ul id="queue"></ul></div>
+      <div class="card after-pair"><div class="label">Recent</div><ul id="recent"></ul></div>
+      <details class="card"><summary>Diagnostics</summary><ul id="log" style="font: 11px/1.5 ui-monospace, monospace; color:#9a9a9a; max-height: 160px; overflow-y: auto"></ul></details>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

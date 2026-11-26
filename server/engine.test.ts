@@ -1,6 +1,9 @@
 // Engine tests against an in-memory Telegram. Run: npm test
 // Each test maps to a failure found in review, so a regression shows up by name.
 
+// Rules only and template drafts: tests never call an LLM.
+process.env.WARDEN_LLM ??= 'none'
+
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -531,11 +534,11 @@ test('a reversed "looks OK" verdict does not leak another group into the title',
   await t.say(A, x, DRAINER)
   await tick(50)
   let card = t.engine.feed(alice)!.queue[0]
-  assert.ok(card.title.startsWith('Likely OK'), card.title)
+  assert.ok(card.likelyOk, card.title)
   // The clone was already in Bob's private group before Warden was added (no join event).
   await t.say(B, clone, DRAINER) // same evidence, plus an impersonation signal
   card = t.engine.feed(alice)!.queue[0]
-  assert.ok(!card.title.startsWith('Likely OK'), 'verdict reversed')
+  assert.ok(!card.likelyOk && card.title !== 'Project update link', `verdict reversed: ${card.title}`)
   assert.equal(card.ai, undefined, 'stale ok verdict cleared')
   assert.ok(![card.title, ...card.signals].some(s => /bob/i.test(s)), JSON.stringify(card))
 })
@@ -596,4 +599,85 @@ test('a failing lift is persisted at once and resumed after a restart', async ()
   await tick(1200)
   const lift = tg2.calls.find(c => c.method === 'restrict' && c.user === 85)
   assert.ok(lift && Object.values(lift.perms!).every(v => v === true), 'the new process lifts the mute')
+})
+
+// ---------------------------------------------------------------- UX pass (2026-11-27)
+
+test('a bare 6-digit code pairs, like /pair', async () => {
+  const t = await setup()
+  const p = t.engine.startPairing()
+  await t.dm(ALICE, p.code)
+  assert.equal(t.engine.feed(p.token)?.admin, '@alice_admin')
+})
+
+test('adding the bot DMs whoever added it once, and again only when its rights change', async () => {
+  const t = await setup()
+  const dmsToAlice = () => t.tg.calls.filter(c => c.method === 'send' && c.chat === ALICE.id).length
+  assert.equal(dmsToAlice(), 2, 'one DM per group added in setup')
+  const promoted = { chat: { id: A, type: 'supergroup' as const, title: `G${A}` }, from: ALICE, date: 0, old_chat_member: { status: 'member' as const, user: BOT }, new_chat_member: { status: 'administrator' as const, user: BOT } }
+  await t.send({ my_chat_member: promoted })
+  assert.equal(dmsToAlice(), 2, 'same rights: no new DM')
+  t.tg.admins.set(A, [adminMember(ALICE), adminMember(BOT, { can_restrict_members: false })])
+  await t.send({ my_chat_member: promoted })
+  assert.equal(dmsToAlice(), 3, 'lost Ban users: one DM')
+  assert.deepEqual(t.engine.feed(await t.pairAs(ALICE))!.groups.find(g => g.id === A)?.missing, ['Ban users'])
+})
+
+test('Later moves a card behind every other open card, whatever its severity', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  const ask = (u: TgUser, bio: string) => t.send({ chat_join_request: { chat: { id: A, type: 'supergroup', title: `G${A}` }, from: u, user_chat_id: u.id, date: 0, bio } })
+  await ask(user(90, 'Crypto Support', undefined), '24/7 wallet recovery help, DM me t.me/+recover')
+  await ask(user(91, 'Kenji', 'kenji_t'), 'Builder. Love TON.')
+  let q = t.engine.feed(alice)!.queue
+  assert.equal(q.length, 2)
+  const first = q[0]
+  assert.ok(first.severity >= q[1].severity)
+  assert.equal(first.actions.find(a => a.id === 'later')?.label, 'Leave pending')
+  assert.equal((await t.engine.act(alice, first.id, 'later')).ok, true)
+  q = t.engine.feed(alice)!.queue
+  assert.equal(q[q.length - 1].id, first.id, 'deferred card is last')
+})
+
+test('the result says how long the scam stayed visible', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  const x = user(92, 'Drop', 'drop_live')
+  await t.join(A, x)
+  await t.say(A, x, DRAINER)
+  const card = t.engine.feed(alice)!.queue[0]
+  assert.equal(card.target, '@drop_live')
+  await t.engine.act(alice, card.id, 'ban')
+  await tick(200)
+  const done = t.engine.feed(alice)!.recent[0]
+  assert.match(done.resolution!.summary, /^Banned in 1 group · 1 msg removed · live \d+s$/)
+  assert.ok((done.resolution!.liveSec ?? 0) >= 1)
+  assert.ok(t.engine.feed(alice)!.stats.avgLiveSec! >= 1)
+})
+
+test('an AI "ok" verdict counts as cleared and marks the card likely OK', async () => {
+  const ok: Verdict = { category: 'ok', confidence: 'high', label: 'Warns about a drainer', reason: 'Tells members to avoid the link' }
+  const t = await setup({ review: async () => ok })
+  const alice = await t.pairAs(ALICE)
+  const x = user(93, 'Yuki', 'yuki_warns')
+  await t.join(A, x)
+  await t.say(A, x, DRAINER)
+  await tick(50)
+  const f = t.engine.feed(alice)!
+  assert.equal(f.queue[0].likelyOk, true)
+  assert.equal(f.queue[0].title, 'Warns about a drainer')
+  assert.equal(f.queue[0].actions[0].id, 'dismiss')
+  assert.equal(f.stats.aiCleared, 1)
+})
+
+test('scam cards carry a ready warning draft with no links or handles', async () => {
+  const t = await setup()
+  const alice = await t.pairAs(ALICE)
+  const x = user(94, 'Drop', 'drop_draft')
+  await t.join(A, x)
+  await t.say(A, x, DRAINER)
+  await tick(50)
+  const card = t.engine.feed(alice)!.queue[0]
+  assert.ok(card.draft?.startsWith("⚠️"), card.draft ?? "no draft")
+  assert.doesNotMatch(card.draft!, /https?:|t\.me|@drop/)
 })

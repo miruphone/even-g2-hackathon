@@ -15,7 +15,7 @@
 import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { draftWarning, llmName, review as llmReview, type ReviewInput, type Verdict } from './classify.ts'
+import { draftWarning, llmName, review as llmReview, templateWarning, type ReviewInput, type Verdict } from './classify.ts'
 import {
   adminHandle,
   analyzeJoin,
@@ -82,10 +82,14 @@ export interface Card {
   status: 'open' | 'pending' | 'resolved' | 'dismissed'
   actions: CardAction[]
   pending?: { action: ActionId; label: string; until: number; attempt: string }
-  resolution?: { action: ActionId; summary: string; at: number }
+  resolution?: { action: ActionId; summary: string; at: number; liveSec?: number }
   attempt?: string // history entries: the action attempt they record
   error?: string
   ai?: string // verdict source, e.g. "OpenAI: scam (high)"
+  aiReason?: string // the verdict's one-line reason, ≤ 60 chars
+  likelyOk?: boolean // the AI overruled the rules
+  target?: string // who: "@handle", a name, or "3 accounts"
+  draft?: string // Warden's own public warning, ready for "warn group" (never the message text)
   createdAt: number
   // Phone-only detail (never sent to the glasses UI).
   sample?: string
@@ -96,8 +100,8 @@ export interface Feed {
   rev: number
   now: number
   admin?: string
-  groups: { id: number; title: string; rights: boolean }[]
-  stats: { scanned: number; handled: number; autoMuted: number }
+  groups: { id: number; title: string; rights: boolean; missing: string[] }[]
+  stats: { scanned: number; handled: number; autoMuted: number; aiCleared: number; avgLiveSec?: number }
   queue: Card[]
   recent: Card[]
   llm: string
@@ -126,6 +130,7 @@ interface Group {
   adminsAt: number
   active: boolean
   scanned: number
+  cleared?: number // incidents the AI overruled as OK
   lock?: { until: number; saved?: TgChatPermissions }
 }
 
@@ -139,6 +144,8 @@ interface Session {
   lastSeen: number
   autoMute: boolean
   handled: number
+  liveSum?: number // seconds scam messages stayed visible, over `liveN` cleanups
+  liveN?: number
 }
 
 interface Actor {
@@ -156,6 +163,7 @@ interface ChatEvidence {
   title: string
   signals: string[]
   verdict?: Verdict
+  okTitle?: boolean // the title is the AI's "looks fine" label
   sample?: string
   warning?: string
 }
@@ -191,6 +199,9 @@ interface Incident {
   status: Card['status']
   createdAt: number
   updatedAt: number
+  firstMsgAt?: number // when the first offending message was seen
+  deferred?: boolean // "Later": behind every other open card
+  draft?: string // public warning prepared in advance
   likelyOk?: boolean
   pending?: Pending
   lastError?: string
@@ -206,10 +217,10 @@ interface Persisted {
 
 const ACTION_LABEL: Record<ActionId, string> = {
   ban: 'Ban + purge',
-  ban_warn: 'Ban + purge + warn group',
+  ban_warn: 'Ban + purge + warn',
   delete: 'Delete messages',
-  mute: 'Mute 24h',
-  dismiss: 'Not spam - trust',
+  mute: 'Mute 24h + delete',
+  dismiss: 'Not spam: trust user',
   approve: 'Approve',
   decline: 'Decline',
   lock: 'Lock group 10 min',
@@ -412,14 +423,35 @@ export class Engine {
     this.bump()
     const mine = this.groupsFor(s)
     if (mine.length === 0) {
-      return 'Paired with your glasses ✅\n\nNo groups yet. Add me to a group as an admin with "Delete messages" and "Ban users" rights. You must be an admin there too.'
+      return 'Paired with your glasses ✅\n\nNo groups yet. Tap "Add Warden to a group" below: the rights I need are pre-selected. You must be an admin of that group too.'
     }
-    return `Paired with your glasses ✅\n\nWatching ${mine.length} group(s):\n${mine.map(g => `• ${g.title}${this.missingRights(g)}`).join('\n')}`
+    return `Paired with your glasses ✅\n\n${this.groupLines(mine)}\n\nAlerts now appear on your glasses. Messages from admins are never checked.`
   }
 
-  private missingRights(g: Group): string {
-    const miss = [!g.rights.delete && 'delete', !g.rights.restrict && 'ban'].filter(Boolean)
-    return miss.length ? ` (bot is missing rights: ${miss.join(', ')})` : ''
+  /** Rights the bot still needs in a group, in Telegram's own words. */
+  private missing(g: Group): string[] {
+    return [!g.rights.delete && 'Delete messages', !g.rights.restrict && 'Ban users', !g.rights.invite && 'Invite users'].filter(Boolean) as string[]
+  }
+
+  private groupLines(groups: Group[]): string {
+    return groups
+      .map(g => {
+        const miss = this.missing(g)
+        const core = miss.filter(m => m !== 'Invite users')
+        if (core.length) return `⚠️ ${g.title}: can't act yet. Missing: ${core.join(', ')}`
+        return `✅ ${g.title}: ready${miss.length ? ' (join requests need Invite users)' : ''} · ${g.scanned.toLocaleString('en-US')} checked`
+      })
+      .join('\n')
+  }
+
+  /** Telegram's "add bot to group" link with the needed admin rights pre-selected. */
+  addLink(): string | undefined {
+    return this.bot?.username ? `https://t.me/${this.bot.username}?startgroup=warden&admin=delete_messages+restrict_members+invite_users` : undefined
+  }
+
+  private addButton(): Record<string, unknown> {
+    const url = this.addLink()
+    return url ? { reply_markup: { inline_keyboard: [[{ text: '➕ Add Warden to a group', url }]] } } : {}
   }
 
   private groupsFor(s: Session): Group[] {
@@ -646,12 +678,24 @@ export class Engine {
 
   private async onMyChatMember(m: TgChatMemberUpdated) {
     if (m.chat.type === 'private' || m.chat.type === 'channel') return
+    const known = this.groups.has(m.chat.id)
     const g = this.ensureGroup(m.chat)
+    const before = known ? `${g.active}:${this.missing(g).join()}` : ''
     const st = m.new_chat_member.status
     g.active = st === 'administrator' || st === 'member' || st === 'creator'
     await this.refreshAdmins(g)
     this.save()
     this.bump()
+    // Tell whoever added, promoted or removed the bot what it can do now. Groups stay quiet.
+    const after = `${g.active}:${this.missing(g).join()}`
+    if (m.from.is_bot || m.from.id === this.bot?.id || after === before) return
+    const miss = this.missing(g).filter(x => x !== 'Invite users')
+    let text: string
+    if (!g.active) text = `I was removed from "${g.title}" and no longer watch it.`
+    else if (st !== 'administrator' && st !== 'creator') text = `I'm in "${g.title}" but not an admin, so I can't act. Make me an admin with Delete messages and Ban users.`
+    else if (miss.length) text = `⚠️ I'm in "${g.title}" but can't act yet.\nMissing: ${miss.join(', ')}.\nFix: open the group → Administrators → @${this.bot?.username ?? 'bot'} → turn them on.`
+    else text = `✅ Guarding "${g.title}". I can delete messages and ban users${g.rights.invite ? ' and handle join requests' : ''}.\nAlerts show up on your Even G2 glasses. Messages from admins are never checked.`
+    await this.tg.sendMessage(m.from.id, text).catch(() => undefined) // they may never have started the bot
   }
 
   private onChatMember(m: TgChatMemberUpdated) {
@@ -819,7 +863,9 @@ export class Engine {
     if (benign && inc.maxRuleScore < OVERRIDE_SCORE) {
       inc.likelyOk = true
       inc.severity = 1
-      ev.title = `Likely OK: ${v.label}`.slice(0, 28)
+      g.cleared = (g.cleared ?? 0) + 1
+      ev.title = v.label.slice(0, 28) // the card says LIKELY OK in its header
+      ev.okTitle = true
       await Promise.all(inc.autoOps)
       for (const k of [...inc.autoMuted]) {
         const [chatId, userId] = k.split(':').map(Number)
@@ -830,6 +876,18 @@ export class Engine {
       ev.title = v.label
     }
     this.bump()
+  }
+
+  /** Write the public warning in advance, so the wearer can see it before it is posted. */
+  private async prepareDraft(inc: Incident, chatId: number) {
+    if (inc.draft || (inc.kind !== 'scam' && inc.kind !== 'impersonation')) return
+    inc.draft = templateWarning({ groupTitle: '', kind: inc.kind, label: '', signals: [], impersonated: inc.impersonated })
+    const ev = inc.evidence.get(chatId)
+    const text = await draftWarning({ groupTitle: this.groups.get(chatId)?.title ?? '', kind: inc.kind, label: ev?.title ?? KIND_TITLE[inc.kind], signals: ev?.signals ?? [], impersonated: inc.impersonated })
+    if (inc.status === 'open' || inc.status === 'pending') {
+      inc.draft = text
+      this.bump()
+    }
   }
 
   private hasPair(i: Incident, chatId: number, userId: number): boolean {
@@ -881,8 +939,10 @@ export class Engine {
     inc.actors.set(p.actor.id, actorOf(p.actor))
     inc.pairs.set(p.chatId, new Map([[p.actor.id, [...p.messageIds]]]))
     inc.evidence.set(p.chatId, { title: defaultTitle(inc.kind, a, p.impersonated), signals: a.signals.map(s => s.label), sample: p.sample?.slice(0, 280) })
+    if (p.messageIds.length) inc.firstMsgAt = Date.now()
     this.incidents.set(inc.id, inc)
     this.maybeAutoMute(inc, p.chatId, p.actor.id)
+    void this.prepareDraft(inc, p.chatId)
     this.bump()
     return inc
   }
@@ -891,7 +951,10 @@ export class Engine {
     inc.actors.set(user.id, actorOf(user))
     const users = inc.pairs.get(chatId) ?? new Map<number, number[]>()
     const ids = users.get(user.id) ?? []
-    if (messageId !== undefined && !ids.includes(messageId)) ids.push(messageId)
+    if (messageId !== undefined && !ids.includes(messageId)) {
+      ids.push(messageId)
+      inc.firstMsgAt ??= Date.now()
+    }
     users.set(user.id, ids)
     inc.pairs.set(chatId, users)
     const ev = inc.evidence.get(chatId) ?? { title: defaultTitle(inc.kind, a), signals: [] }
@@ -906,7 +969,10 @@ export class Engine {
       inc.likelyOk = false
       for (const [c, e] of inc.evidence) {
         if (e.verdict && (e.verdict.category === 'ok' || e.verdict.category === 'promo')) e.verdict = undefined
-        if (e.title.startsWith('Likely OK')) e.title = c === chatId ? defaultTitle(inc.kind, a) : titleFromSignals(inc.kind, e.signals)
+        if (e.okTitle) {
+          e.title = c === chatId ? defaultTitle(inc.kind, a) : titleFromSignals(inc.kind, e.signals)
+          e.okTitle = false
+        }
       }
     }
     if (!inc.likelyOk) inc.severity = severityOf(inc.score)
@@ -940,20 +1006,37 @@ export class Engine {
     const text = (msg.text ?? '').trim()
     const from = msg.from
     if (!from) return
-    const m = text.match(/^\/(?:start\s+pair_|pair\s+)(\d{6})$/)
+    const send = (t: string, extra: Record<string, unknown> = {}) => this.tg.sendMessage(msg.chat.id, t, extra).catch(() => undefined)
+    const paired = () => [...this.sessions.values()].find(x => x.userId === from.id)
+    // "/start pair_123456" (deep link), "/pair 123456" or just "123456".
+    const m = text.match(/^(?:\/(?:start\s+pair_|pair\s+))?(\d{6})$/)
     if (m) {
       const reply = await this.pair(m[1], from)
-      await this.tg.sendMessage(msg.chat.id, reply).catch(() => undefined)
+      const s = paired()
+      await send(reply, s && this.groupsFor(s).length === 0 ? this.addButton() : {})
+      return
+    }
+    if (text.startsWith('/status')) {
+      const s = paired()
+      if (!s) {
+        await send('Not paired yet. Open Warden on your glasses and send me the 6-digit code shown there.')
+        return
+      }
+      const mine = this.groupsFor(s)
+      await send(
+        `Paired as ${s.userName ?? 'you'} · auto-mute ${s.autoMute ? 'on' : 'off'}\n\n${mine.length ? this.groupLines(mine) : 'No groups yet.'}\n\nYour own messages (and other admins') are never checked.`,
+        mine.length ? {} : this.addButton(),
+      )
       return
     }
     if (text.startsWith('/start') || text.startsWith('/help')) {
-      await this.tg
-        .sendMessage(
-          msg.chat.id,
-          'Warden guards your Telegram groups from your Even G2 glasses.\n\n1. Add me to your group as an admin (Delete messages, Ban users).\n2. Open Warden on the glasses and send me the pairing code: /pair 123456',
-        )
-        .catch(() => undefined)
+      await send(
+        'Warden guards your Telegram groups from your Even G2 glasses: suspicious posts become one-tap cards, and the glasses never show the message text.\n\n1. Open Warden on the glasses and send me the 6-digit code shown there.\n2. Add me to your group with the button below (the rights I need are pre-selected).\n\n/status shows what I watch.',
+        this.addButton(),
+      )
+      return
     }
+    await send('Send me the 6-digit code from your glasses to pair. /status shows what I watch, /help explains setup. Moderation happens on your glasses.')
   }
 
   // ---------------------------------------------------------------- feed
@@ -979,13 +1062,20 @@ export class Engine {
         if (c.autoMuted) autoMuted++
       }
     }
-    queue.sort((a, b) => (a.status === 'pending' ? 1 : 0) - (b.status === 'pending' ? 1 : 0) || b.severity - a.severity || a.createdAt - b.createdAt)
+    const deferred = (c: Card) => (this.incidents.get(c.id)?.deferred ? 1 : 0)
+    queue.sort((a, b) => (a.status === 'pending' ? 1 : 0) - (b.status === 'pending' ? 1 : 0) || deferred(a) - deferred(b) || b.severity - a.severity || a.createdAt - b.createdAt)
     return {
       rev: this.rev,
       now: Date.now(),
       admin: s.userName,
-      groups: groups.map(g => ({ id: g.id, title: g.title, rights: g.rights.delete && g.rights.restrict })),
-      stats: { scanned: groups.reduce((n, g) => n + g.scanned, 0), handled: s.handled, autoMuted },
+      groups: groups.map(g => ({ id: g.id, title: g.title, rights: g.rights.delete && g.rights.restrict, missing: this.missing(g) })),
+      stats: {
+        scanned: groups.reduce((n, g) => n + g.scanned, 0),
+        handled: s.handled,
+        autoMuted,
+        aiCleared: groups.reduce((n, g) => n + (g.cleared ?? 0), 0),
+        avgLiveSec: s.liveN ? Math.round((s.liveSum ?? 0) / s.liveN) : undefined,
+      },
       queue,
       recent: (s.userId ? this.history.get(s.userId) : undefined)?.slice(0, 10) ?? [],
       llm: '',
@@ -1020,7 +1110,7 @@ export class Engine {
     const who = (a: Actor) => (a.username ? '@' + a.username : a.name)
     let detail: string
     if (i.kind === 'raid') detail = `${groups[0]} · new members flooding in`
-    else if (i.kind === 'join') detail = `${first ? who(first) : '?'} → ${groups[0]}`
+    else if (i.kind === 'join') detail = `${first ? who(first) : '?'} asks to join ${groups[0]}`
     else {
       const w = actors.length > 1 ? `${actors.length} accounts` : first ? who(first) : 'unknown'
       const where = groups.length > 1 ? `${groups.length} groups` : groups[0]
@@ -1045,6 +1135,10 @@ export class Engine {
       pending: p ? { action: p.action, label: this.actionLabel(i, p.action, p.scope.size), until: p.until, attempt: p.attempt } : undefined,
       error: i.lastError,
       ai: ev?.verdict ? `${llmName()}: ${ev.verdict.category} (${ev.verdict.confidence})` : undefined,
+      aiReason: ev?.verdict?.reason,
+      likelyOk: i.likelyOk || undefined,
+      target: i.kind === 'raid' ? groups[0] : actors.length > 1 ? `${actors.length} accounts` : first ? who(first) : undefined,
+      draft: actions.some(a => a.id === 'ban_warn') || p?.action === 'ban_warn' ? i.draft : undefined,
       createdAt: i.createdAt,
       sample: evs.find(e => e.sample)?.sample,
       warning: evs.find(e => e.warning)?.warning,
@@ -1069,15 +1163,16 @@ export class Engine {
 
   private actionLabel(i: Incident, a: ActionId, chats: number): string {
     const scope = chats > 1 ? ` (${chats} groups)` : ''
-    if (a === 'ban' || a === 'delete' || a === 'mute') return ACTION_LABEL[a] + scope
-    if (a === 'dismiss' && (i.kind === 'raid' || i.kind === 'join')) return 'Ignore'
+    if (a === 'ban' || a === 'ban_warn' || a === 'delete' || a === 'mute') return ACTION_LABEL[a] + scope
+    if (a === 'dismiss' && i.kind === 'raid') return 'Ignore'
+    if (a === 'later' && i.kind === 'join') return 'Leave pending'
     return ACTION_LABEL[a]
   }
 
   // ---------------------------------------------------------------- actions
 
   /** Start an action. Rights are checked with Telegram first; reversible steps run now; the rest commits after the undo window. */
-  async act(token: string, incidentId: string, action: ActionId): Promise<{ ok: boolean; error?: string; card?: Card; attempt?: string }> {
+  async act(token: string, incidentId: string, action: ActionId): Promise<{ ok: boolean; error?: string; card?: Card; attempt?: string; now?: number }> {
     const s = this.session(token)
     const i = this.incidents.get(incidentId)
     if (!s?.userId) return { ok: false, error: 'not paired' }
@@ -1090,7 +1185,7 @@ export class Engine {
     if (cached.size === 0) return { ok: false, error: 'no admin rights for this' }
 
     if (action === 'later') {
-      i.createdAt = Date.now()
+      i.deferred = true
       this.bump()
       return { ok: true }
     }
@@ -1122,7 +1217,7 @@ export class Engine {
     })()
     i.pending = { attempt, action, by: userId, token, scope, until: Date.now() + this.undoMs, immediate, mutes, timer: setTimeout(() => void this.commit(i), this.undoMs) }
     this.bump()
-    return { ok: true, attempt, card: this.card(i, userId) ?? undefined }
+    return { ok: true, attempt, card: this.card(i, userId) ?? undefined, now: Date.now() }
   }
 
   async undo(token: string, incidentId?: string): Promise<{ ok: boolean; error?: string; id?: string; attempt?: string }> {
@@ -1171,7 +1266,7 @@ export class Engine {
     }
 
     let removed = 0
-    let banned = 0
+    const bannedUsers = new Set<number>()
     let already = 0
     let lifted = 0
     const action = p.action
@@ -1182,7 +1277,7 @@ export class Engine {
           try {
             await this.tg.banChatMember(chatId, u, true)
             okPairs.add(key(chatId, u))
-            banned++
+            bannedUsers.add(u)
             any = true
             // revoke_messages already removes their messages in supergroups; this covers basic groups.
             const all = [...ids, ...(this.userMsgs.get(key(chatId, u)) ?? []).map(m => m.id)]
@@ -1194,7 +1289,7 @@ export class Engine {
         if (any && action === 'ban_warn') {
           const g = this.groups.get(chatId)
           const ev = i.evidence.get(chatId)
-          const text = ev?.warning ?? (await draftWarning({ groupTitle: g?.title ?? '', kind: i.kind, label: ev?.title ?? KIND_TITLE[i.kind], signals: ev?.signals ?? [], impersonated: i.impersonated }))
+          const text = ev?.warning ?? i.draft ?? (await draftWarning({ groupTitle: g?.title ?? '', kind: i.kind, label: ev?.title ?? KIND_TITLE[i.kind], signals: ev?.signals ?? [], impersonated: i.impersonated }))
           try {
             await this.tg.sendMessage(chatId, text)
             if (ev) ev.warning = text
@@ -1303,6 +1398,9 @@ export class Engine {
     }
     const chats = done.size
     const parts: string[] = []
+    // How long the offending messages stayed visible: from the first one to their removal.
+    const liveSec = removed > 0 && i.firstMsgAt ? Math.max(1, Math.round((Date.now() - i.firstMsgAt) / 1000)) : undefined
+    const banned = bannedUsers.size
     if (action === 'ban' || action === 'ban_warn') parts.push(`Banned ${banned > 1 ? `${banned} accounts ` : ''}in ${plural(chats, 'group')}`, `${plural(removed, 'msg')} removed`)
     else if (action === 'delete') parts.push(`${plural(removed, 'msg')} removed`)
     else if (action === 'mute') {
@@ -1314,14 +1412,15 @@ export class Engine {
     else if (action === 'approve') parts.push('Approved')
     else if (action === 'decline') parts.push('Declined')
     else if (action === 'lock') parts.push('Group locked 10 min')
+    if (liveSec !== undefined) parts.push(`live ${liveSec}s`)
     parts.push(...notes)
     if (errors.length) parts.push(`${errors.length} failed`)
-    const summary = parts.join(' · ').slice(0, 60)
+    const summary = parts.join(' · ').slice(0, 90)
     if (errors.length) console.warn(`[engine] ${action} on ${i.id}:`, errors.join('; '))
     const snap: Card = {
       ...this.cardFrom(i, done, []),
       status: action === 'dismiss' ? 'dismissed' : 'resolved',
-      resolution: { action, summary, at: Date.now() },
+      resolution: { action, summary, at: Date.now(), liveSec },
       attempt: p.attempt,
       pending: undefined,
       error: undefined,
@@ -1343,7 +1442,13 @@ export class Engine {
     const h = this.history.get(p.by) ?? []
     h.unshift(snap)
     this.history.set(p.by, h.slice(0, 30))
-    if (s) s.handled++
+    if (s) {
+      s.handled++
+      if (liveSec !== undefined) {
+        s.liveSum = (s.liveSum ?? 0) + liveSec
+        s.liveN = (s.liveN ?? 0) + 1
+      }
+    }
     this.save()
     this.bump()
   }

@@ -48,10 +48,10 @@ Categories:
 - toxic: harassment, slurs, threats
 - ok: normal conversation, including normal talk about prices, wallets and tokens
 
-Be conservative: ordinary crypto talk (prices, addresses shared on request, questions about airdrops) is ok. Use high confidence only when the evidence is unambiguous.`
+Be conservative: ordinary crypto talk (prices, addresses shared on request, questions about airdrops) is ok. A member warning others about a scam is ok, even when the warning quotes the scam link or words like "claim" and "connect your wallet": judge what the sender asks readers to do, not which words or links appear. Use high confidence only when the evidence is unambiguous.`
 
 const WARNING_SYSTEM =
-  'You write the public warning a Telegram community admin posts after removing a scam or spam account. One or two sentences, at most 200 characters, calm, starts with "⚠️". Say what was removed and the one safety rule that matters (admins never DM first, no claim links, never share a seed phrase). No links, no usernames of the scammer, no markdown. Output only the warning text.'
+  'You write the public warning a Telegram community admin posts after removing a scam or spam account. One or two sentences, at most 200 characters, calm, starts with "⚠️". Say what was removed and the one safety rule that matters (admins never DM first, use only links from official announcements, never share a seed phrase). Do not claim facts about the project you were not given (for example whether a real airdrop exists). No links, no @usernames, no markdown. Output only the warning text.'
 
 // ---------------------------------------------------------------------------
 // Provider selection
@@ -202,12 +202,17 @@ export interface WarningInput {
 
 export function templateWarning(w: WarningInput): string {
   if (w.kind === 'impersonation') {
-    return `⚠️ Heads-up: an account copying ${w.impersonated ?? 'an admin'} was removed. Admins never DM you first and never ask for funds or seed phrases.`
+    return `⚠️ We banned an account pretending to be ${w.impersonated ?? 'an admin'}. Our admins never DM you first and never ask for funds or seed phrases.`
   }
   if (w.kind === 'scam') {
-    return '⚠️ Heads-up: a scam post was removed. There is no claim or airdrop link from the team. Never connect your wallet or share your seed phrase.'
+    return '⚠️ We removed a scam post and banned the account. Use only links from official announcements, and never share your seed phrase.'
   }
-  return '⚠️ Spam was removed. Please report suspicious DMs to the admins.'
+  return '⚠️ We removed spam and banned the sender. Got a strange DM? Don\'t click. Tell an admin.'
+}
+
+/** An AI draft is posted publicly: no links, handles or markdown, and it must read as a warning. */
+function safeDraft(text: string): boolean {
+  return text.startsWith('⚠️') && !/(https?:|www\.|t\.me|@\w|\[|\*|`)/i.test(text) && text.length <= 240
 }
 
 function warningPrompt(w: WarningInput): string {
@@ -237,7 +242,7 @@ export async function draftWarning(w: WarningInput): Promise<string> {
       text = res.content.flatMap(b => (b.type === 'text' ? [b.text] : [])).join('')
     }
     text = text.trim()
-    return text ? text.slice(0, 300) : templateWarning(w)
+    return safeDraft(text) ? text : templateWarning(w)
   } catch (e) {
     console.warn('[classify] draft failed:', e instanceof Error ? e.message : e)
     return templateWarning(w)

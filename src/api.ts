@@ -22,9 +22,13 @@ export interface Card {
   actions: { id: ActionId; label: string }[]
   pending?: { action: ActionId; label: string; until: number; attempt: string }
   attempt?: string
-  resolution?: { action: ActionId; summary: string; at: number }
+  resolution?: { action: ActionId; summary: string; at: number; liveSec?: number }
   error?: string
   ai?: string
+  aiReason?: string
+  likelyOk?: boolean
+  target?: string
+  draft?: string
   createdAt: number
   sample?: string
   warning?: string
@@ -34,12 +38,13 @@ export interface Feed {
   rev: number
   now: number
   admin?: string
-  groups: { id: number; title: string; rights: boolean }[]
-  stats: { scanned: number; handled: number; autoMuted: number }
+  groups: { id: number; title: string; rights: boolean; missing: string[] }[]
+  stats: { scanned: number; handled: number; autoMuted: number; aiCleared: number; avgLiveSec?: number }
   queue: Card[]
   recent: Card[]
   llm: string
   bot: string | null
+  addLink?: string
   paired: boolean
   code?: string
   codeExpires?: number
@@ -106,7 +111,7 @@ export class Api {
   }
 
   act(id: string, action: ActionId) {
-    return this.request<{ ok: boolean; error?: string; card?: Card; attempt?: string }>('POST', '/act', { id, action })
+    return this.request<{ ok: boolean; error?: string; card?: Card; attempt?: string; now?: number }>('POST', '/act', { id, action })
   }
 
   undo(id?: string) {

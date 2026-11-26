@@ -102,6 +102,10 @@ let created = false
 let pageGeneration = 0
 const pendingText = new Map<string, { id: number; name: string; content: string }>()
 let flushScheduled = false
+// Container ids on the current page, by name. Pages number their containers
+// 1..n in order: the host only updates text in containers whose id is in that
+// range, so a fixed id like 5 on a 4-container page silently never updates.
+let pageIds = new Map<string, number>()
 
 export function initGlasses(b: EvenAppBridge) {
   bridge = b
@@ -112,6 +116,7 @@ export function getBridge(): EvenAppBridge {
 }
 
 function toPayload(spec: PageSpec) {
+  pageIds = new Map(spec.containers.map((c, i) => [c.name, i + 1]))
   const texts: TextContainerProperty[] = []
   const lists: ListContainerProperty[] = []
   const images: ImageContainerProperty[] = []
@@ -121,7 +126,7 @@ function toPayload(spec: PageSpec) {
       yPosition: c.y,
       width: c.w,
       height: c.h,
-      containerID: c.id,
+      containerID: pageIds.get(c.name) ?? c.id,
       containerName: c.name,
       ...(c.z !== undefined ? { zOrderIndex: c.z } : {}),
     }
@@ -202,7 +207,7 @@ export async function renderPage(spec: PageSpec): Promise<boolean> {
  * 10 Hz sensor feed never builds a backlog on the BLE link.
  */
 export function setText(id: number, name: string, content: string) {
-  pendingText.set(name, { id, name, content })
+  pendingText.set(name, { id: pageIds.get(name) ?? id, name, content })
   if (flushScheduled) return
   flushScheduled = true
   const generation = pageGeneration

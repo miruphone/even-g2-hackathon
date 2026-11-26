@@ -36,7 +36,7 @@ const ALL_PERMISSIONS = { ...OPEN, can_change_info: true, can_invite_users: true
 const chats = new Map<number, MockChat>()
 const users = new Map<number, TgUser>()
 const updates: TgUpdate[] = []
-const dms: { from: string; text: string; at: number }[] = []
+const dms: { from: string; text: string; at: number; buttons?: { text: string; url?: string }[] }[] = []
 let updateId = 1
 let messageId = 100
 let nextUserId = 5000
@@ -197,6 +197,15 @@ const SCENARIOS: Record<string, { title: string; run: () => Promise<void> }> = {
       }
     },
   },
+  warner: {
+    title: 'Newcomer warns about the drainer',
+    run: async () => {
+      const u = newUser('Yuki', 'yuki_onchain')
+      join(-1001, u)
+      await sleep(1200)
+      say(-1001, u, 'Careful everyone: that "claim your airdrop" link https://tonfront-claim.app/connect is a wallet drainer. Do NOT connect your wallet, the team never DMs first.')
+    },
+  },
   gray: {
     title: 'Ambiguous newcomer link',
     run: async () => {
@@ -259,7 +268,8 @@ async function api(method: string, p: Record<string, unknown>): Promise<unknown>
         .map(m => ({ status: m.status, user: m.user, can_delete_messages: true, can_restrict_members: true, can_invite_users: true, can_pin_messages: true }))
     case 'sendMessage': {
       if (chatId > 0) {
-        dms.push({ from: 'bot', text: String(p.text), at: Date.now() })
+        const kb = (p.reply_markup as { inline_keyboard?: { text: string; url?: string }[][] } | undefined)?.inline_keyboard
+        dms.push({ from: 'bot', text: String(p.text), at: Date.now(), buttons: kb?.flat() })
         note(`bot → DM: ${String(p.text).split('\n')[0]}`)
         return { message_id: messageId++, chat: { id: chatId, type: 'private' }, date: 0, text: p.text }
       }
@@ -366,7 +376,7 @@ function state() {
         deleted: !!m.deleted,
       })),
     })),
-    dms: dms.slice(-5),
+    dms: dms.slice(-8),
     log: log.slice(-30),
   }
 }

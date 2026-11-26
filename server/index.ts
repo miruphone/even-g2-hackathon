@@ -124,6 +124,7 @@ const server = createServer(async (req, res) => {
         ...feed,
         llm: llmStatus(),
         bot: engine.bot?.username ?? null,
+        addLink: engine.addLink(),
         paired: !!session.userId,
         code: session.userId ? undefined : session.code,
         autoMute: session.autoMute,
