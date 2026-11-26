@@ -715,6 +715,16 @@ export class Engine {
     if (chat.type === 'private') return this.onPrivate(msg)
     if (chat.type === 'channel') return
     const g = this.ensureGroup(chat)
+    if (msg.migrate_to_chat_id) {
+      // Promoting an admin with custom rights turns a basic group into a supergroup
+      // with a new id. Retire the old one; the new one arrives with its own updates.
+      g.active = false
+      console.log(`[engine] ${g.title} migrated to a supergroup (${msg.migrate_to_chat_id})`)
+      void this.ensureGroup({ id: msg.migrate_to_chat_id, title: g.title })
+      this.save()
+      this.bump()
+      return
+    }
     if (msg.new_chat_members) {
       for (const u of msg.new_chat_members) if (u.id !== this.bot?.id) this.noteJoin(g, u)
       return

@@ -40,6 +40,7 @@ export interface TgMessage {
   left_chat_member?: TgUser
   forward_origin?: { type: string; sender_user?: TgUser; chat?: TgChat; sender_user_name?: string }
   via_bot?: TgUser
+  migrate_to_chat_id?: number // a basic group became a supergroup (e.g. when an admin with custom rights is added)
   reply_markup?: { inline_keyboard?: { text: string; url?: string }[][] }
 }
 
