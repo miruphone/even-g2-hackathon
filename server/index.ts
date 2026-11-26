@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { checkLlm, llmStatus } from './classify.ts'
 import { Engine, type ActionId } from './engine.ts'
-import { Telegram } from './telegram.ts'
+import { Telegram, type TgUpdate } from './telegram.ts'
 
 const PORT = Number(process.env.PORT ?? 8787)
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? ''
@@ -43,6 +43,7 @@ async function pollLoop() {
       const updates = await tg.getUpdates(offset, 25)
       for (const u of updates) {
         offset = u.update_id + 1
+        if (process.env.WARDEN_LOG_UPDATES !== '0') console.log(`[bot] update ${describe(u)}`)
         await engine.handleUpdate(u)
       }
     } catch (e) {
@@ -163,6 +164,15 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => console.log(`[http] Warden API on :${PORT}`))
 void pollLoop()
+
+/** One line per update, without message text (privacy). */
+function describe(u: TgUpdate): string {
+  const kind = Object.keys(u).find(k => k !== 'update_id') ?? '?'
+  const body = (u as unknown as Record<string, { chat?: { type?: string; title?: string; id?: number }; new_chat_member?: { status?: string } }>)[kind]
+  const chat = body?.chat ? `${body.chat.type} "${body.chat.title ?? 'DM'}" (${body.chat.id})` : ''
+  const status = body?.new_chat_member?.status ? ` -> ${body.new_chat_member.status}` : ''
+  return `${kind} ${chat}${status}`
+}
 
 function sleep(ms: number) {
   return new Promise(r => setTimeout(r, ms))
