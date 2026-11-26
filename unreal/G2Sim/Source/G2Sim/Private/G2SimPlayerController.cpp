@@ -1,6 +1,7 @@
 #include "G2SimPlayerController.h"
 
 #include "Camera/CameraComponent.h"
+#include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "HeadMountedDisplayFunctionLibrary.h"
 #include "Engine/World.h"
@@ -8,6 +9,9 @@
 #include "G2SimCharacter.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "InputCoreTypes.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "UnrealEngine.h"
 
 namespace
 {
@@ -49,6 +53,24 @@ void AG2SimPlayerController::BeginPlay()
 		}
 		SetControlRotation(FRotator(0, GetControlRotation().Yaw, 0));
 		bHelp = false;
+	}
+	else
+	{
+		// Desktop glasses display placement, e.g. to leave room for overlays in a recording.
+		float HudScale = 1.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("hudscale="), HudScale))
+		{
+			DisplayWidth = FMath::Clamp(DisplayWidth * HudScale, 0.15f, 0.95f);
+		}
+		FParse::Value(FCommandLine::Get(), TEXT("hudx="), DisplayOffsetX);
+	}
+	if (!bVR && FParse::Param(FCommandLine::Get(), TEXT("cinematic")))
+	{
+		bCinematic = true;
+		bHelp = false;
+		FParse::Value(FCommandLine::Get(), TEXT("cineamount="), CineAmount);
+		FSystemResolution::RequestResolutionChange(1920, 1080, EWindowMode::Windowed);
+		GEngine->bEnableOnScreenDebugMessages = false; // no "Preparing textures" etc. on the recording
 	}
 	SetMouseFree(false);
 }
@@ -144,6 +166,21 @@ void AG2SimPlayerController::PlayerTick(float DeltaTime)
 		}
 	}
 
+	if (bCinematic)
+	{
+		// Recording: no local gestures, the view moves by itself. Esc still
+		// releases the mouse (a click takes it back, without a tap).
+		if (WasInputKeyJustPressed(EKeys::Escape) || (bMouseFree && WasInputKeyJustPressed(EKeys::LeftMouseButton)))
+		{
+			SetMouseFree(!bMouseFree);
+		}
+		if (WasInputKeyJustPressed(EKeys::P)) bCinePaused = !bCinePaused;
+		UpdateCinematicLook(DeltaTime);
+		UpdateDisplayKeys(DeltaTime);
+		UpdateSensors(DeltaTime);
+		return;
+	}
+
 	if (WasInputKeyJustPressed(EKeys::Escape))
 	{
 		if (bMenuOpen)
@@ -181,15 +218,50 @@ void AG2SimPlayerController::PlayerTick(float DeltaTime)
 		UpdateGlassesInput();
 	}
 
-	// View toggles.
 	if (WasInputKeyJustPressed(EKeys::H)) bHelp = !bHelp;
+	UpdateDisplayKeys(DeltaTime);
+	UpdateSensors(DeltaTime);
+}
+
+void AG2SimPlayerController::UpdateDisplayKeys(float DeltaTime)
+{
 	if (WasInputKeyJustPressed(EKeys::G)) bShowGlasses = !bShowGlasses;
 	if (IsInputKeyDown(EKeys::RightBracket)) DisplayWidth = FMath::Min(0.95f, DisplayWidth + DeltaTime * 0.3f);
 	if (IsInputKeyDown(EKeys::LeftBracket)) DisplayWidth = FMath::Max(0.15f, DisplayWidth - DeltaTime * 0.3f);
 	if (IsInputKeyDown(EKeys::PageUp)) DisplayCenterY = FMath::Max(0.1f, DisplayCenterY - DeltaTime * 0.3f);
 	if (IsInputKeyDown(EKeys::PageDown)) DisplayCenterY = FMath::Min(0.9f, DisplayCenterY + DeltaTime * 0.3f);
+}
 
-	UpdateSensors(DeltaTime);
+void AG2SimPlayerController::UpdateCinematicLook(float DeltaTime)
+{
+	if (!GetPawn())
+	{
+		return;
+	}
+	if (!bCineBaseSet)
+	{
+		// The player start's view, captured once the pawn is in place.
+		bCineBaseSet = true;
+		// -cinepitch= / -cineyaw= (degrees) frame the shot relative to the start.
+		float BasePitch = 0.f, BaseYaw = 0.f;
+		FParse::Value(FCommandLine::Get(), TEXT("cinepitch="), BasePitch);
+		FParse::Value(FCommandLine::Get(), TEXT("cineyaw="), BaseYaw);
+		CineBase = FRotator(BasePitch, GetControlRotation().Yaw + BaseYaw, 0);
+	}
+	if (!bCinePaused)
+	{
+		CineTime += DeltaTime;
+	}
+
+	// A slow, aperiodic look-around: a few incommensurate sines per axis,
+	// faded in over the first seconds so the view never jumps.
+	const double T = CineTime;
+	const double Wave = 2.0 * UE_DOUBLE_PI;
+	const float Fade = FMath::SmoothStep(0.f, 6.f, float(T)) * CineAmount;
+	const float Yaw = float(11.0 * FMath::Sin(Wave * T / 61.0) + 3.0 * FMath::Sin(Wave * T / 23.0 + 1.3));
+	const float Pitch = float(1.8 * FMath::Sin(Wave * T / 31.0 + 0.7) + 0.5 * FMath::Sin(Wave * T / 13.0 + 2.0));
+	const float Roll = float(0.9 * FMath::Sin(Wave * T / 37.0 + 2.1));
+	SetControlRotation(FRotator(CineBase.Pitch + Pitch * Fade, CineBase.Yaw + Yaw * Fade, Roll * Fade));
 }
 
 void AG2SimPlayerController::UpdateLook(float DeltaTime)

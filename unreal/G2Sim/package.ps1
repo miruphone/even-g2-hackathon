@@ -20,10 +20,13 @@ $out = Join-Path $PSScriptRoot 'Packaged'
 $previousRuntime = $env:XR_RUNTIME_JSON
 $env:XR_RUNTIME_JSON = Join-Path $env:TEMP 'g2sim-no-openxr-runtime.json'
 try {
+  # -noxgeshadercompile: with IncrediBuild installed, the cooker handed new
+  # shaders to XGE and waited on them forever. Compile them locally.
   & (Join-Path $Engine 'Engine\Build\BatchFiles\RunUAT.bat') BuildCookRun `
     "-project=$project" -platform=Win64 -clientconfig=Shipping `
     -build -cook -stage -pak -iostore -archive "-archivedirectory=$out" `
-    -nop4 -utf8output -unattended
+    -nop4 -utf8output -unattended `
+    -AdditionalCookerOptions=-noxgeshadercompile
   if ($LASTEXITCODE -ne 0) { throw "BuildCookRun failed ($LASTEXITCODE)" }
 }
 finally {

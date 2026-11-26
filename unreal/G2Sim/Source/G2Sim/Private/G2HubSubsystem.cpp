@@ -3,6 +3,7 @@
 #include "Containers/Ticker.h"
 #include "Dom/JsonObject.h"
 #include "Engine/Texture2D.h"
+#include "GameMapsSettings.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "IWebSocket.h"
@@ -49,6 +50,15 @@ const TCHAR* UG2HubSubsystem::GestureName(EG2Gesture Gesture)
 void UG2HubSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+
+	// -world=basic: the procedural city block on the engine's empty map instead
+	// of the default world. Game instance subsystems initialize before the
+	// game instance opens its default map, so this is early enough.
+	FString World;
+	if (!GIsEditor && FParse::Value(FCommandLine::Get(), TEXT("world="), World) && World == TEXT("basic"))
+	{
+		UGameMapsSettings::SetGameDefaultMap(TEXT("/Engine/Maps/Entry"));
+	}
 
 	Url = TEXT("ws://127.0.0.1:5173/__emu/ws");
 	FParse::Value(FCommandLine::Get(), TEXT("hub="), Url);

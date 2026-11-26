@@ -185,6 +185,10 @@ void AG2SimHUD::DrawHUD()
 	{
 		DrawGlasses(PC, Hub);
 	}
+	if (PC->bCinematic)
+	{
+		return; // recording: the glasses display only
+	}
 	if (PC->bMenuOpen)
 	{
 		DrawMenu(PC, Hub);
@@ -205,7 +209,7 @@ void AG2SimHUD::DrawGlasses(AG2SimPlayerController* PC, UG2HubSubsystem* Hub)
 	}
 	const float W = Canvas->SizeX * PC->DisplayWidth;
 	const float H = W / 2.f; // 576 x 288
-	const float X = (Canvas->SizeX - W) / 2.f;
+	const float X = (Canvas->SizeX - W) / 2.f + PC->DisplayOffsetX * Canvas->SizeX / 1920.f;
 	const float Y = Canvas->SizeY * PC->DisplayCenterY - H / 2.f;
 
 	// Soft glow: a few faint offset copies, then the sharp image.

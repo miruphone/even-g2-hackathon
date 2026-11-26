@@ -6,6 +6,6 @@ public class G2Sim : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "InputCore" });
-		PrivateDependencyModuleNames.AddRange(new[] { "WebSockets", "Json", "ImageWrapper", "RenderCore", "RHI", "HeadMountedDisplay", "XRBase" });
+		PrivateDependencyModuleNames.AddRange(new[] { "WebSockets", "Json", "ImageWrapper", "RenderCore", "RHI", "HeadMountedDisplay", "XRBase", "EngineSettings" });
 	}
 }

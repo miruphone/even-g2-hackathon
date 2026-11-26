@@ -23,6 +23,11 @@
  *
  * The head pose is streamed as IMU while the app has IMU on, and the
  * position is sent as GPS (+X north, +Y east from Tokyo Station).
+ *
+ * -cinematic (desktop, for recording): 1920x1080 window, no cursor, help or
+ * status bar, and a slow automatic look-around. Mouse and gesture keys are
+ * ignored, so gestures come only from outside through the hub.
+ * P pauses / resumes the motion; G, [ ], PgUp / PgDn still adjust the display.
  */
 UCLASS()
 class G2SIM_API AG2SimPlayerController : public APlayerController
@@ -39,6 +44,7 @@ public:
 
 	// UI state read by AG2SimHUD.
 	bool bVR = false;
+	bool bCinematic = false;
 	float VrWidthDeg = 24.f; // apparent width of the glasses display
 	float VrPitchDeg = 2.f;  // its height above the view centre
 	EG2Source Source = EG2Source::Right;
@@ -50,6 +56,7 @@ public:
 	bool bMouseFree = false;
 	float DisplayWidth = 0.42f;   // fraction of the screen width
 	float DisplayCenterY = 0.40f; // fraction of the screen height
+	float DisplayOffsetX = 0.f;   // -hudx=: horizontal shift in 1920-wide pixels (+ = right)
 	FString LastAction;
 	double LastActionTime = -100.0;
 	FVector LastImu = FVector::ZeroVector;
@@ -68,6 +75,8 @@ private:
 	void Note(const FString& Text);
 	void SetMouseFree(bool bFree);
 	void UpdateLook(float DeltaTime);
+	void UpdateCinematicLook(float DeltaTime);
+	void UpdateDisplayKeys(float DeltaTime);
 	void UpdateMove();
 	void UpdateGlassesInput();
 	void UpdateMenuInput();
@@ -80,6 +89,12 @@ private:
 	void SnapTurn(float DeltaYaw);
 
 	float HeadRoll = 0.f;
+	// Cinematic look-around: offsets from CineBase over CineTime (paused with P).
+	bool bCineBaseSet = false;
+	bool bCinePaused = false;
+	FRotator CineBase = FRotator::ZeroRotator;
+	double CineTime = 0.0;
+	float CineAmount = 1.f; // -cineamount= scales the motion (0 = still)
 	EG2Source LongPressSource = EG2Source::Right;
 	FKey LongPressKey;
 	bool bStickLatched = false;
