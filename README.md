@@ -71,7 +71,8 @@ The phone page inside the Even app handles pairing, lists your groups with any m
 
 ## Privacy and safety
 
-- The glasses never show message text, only Warden's verdict. Message text stays on the backend in memory and is shown only on the admin's phone.
+- The glasses never show message text, only Warden's verdict. Message text is kept in the backend's memory only (never written to disk) and shown only on the admin's phone.
+- Messages the rules flag or cannot settle are sent to the configured LLM provider (OpenAI by default, or Claude) for a verdict, with the sender's display name and the group title. Set `WARDEN_LLM=none` to keep everything on your server and run on rules only. Admins' own messages are never checked.
 - Actions run only in groups where the paired Telegram account is an admin, and the server checks this on every action.
 - Each destructive action starts with a mute that can be undone and gives a 5-second undo window. "Not spam: trust user" lifts the auto-mute and whitelists the user in that group.
 - The classifier treats message text as untrusted data, so injected instructions are only evidence. It is told to be conservative about normal crypto conversation.
