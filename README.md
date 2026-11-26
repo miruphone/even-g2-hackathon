@@ -19,6 +19,8 @@ After the tap, the same card stays up for 5 seconds (`▶ Banning @ton_rewards_d
 
 **Track:** 01 Messaging & News (Telegram). Also entered for Best Telegram integration.
 
+**Demo video (2:56):** https://youtu.be/i-VfNVTMjZw
+
 ## The problem
 
 Every crypto and Web3 project runs on Telegram groups, and every launch, AMA and airdrop brings a wave of attacks:
